@@ -9,8 +9,10 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/schollz/progressbar/v3"
@@ -82,6 +84,8 @@ func run(cmd *cobra.Command, args []string) {
 
 	contentLength := resp.ContentLength
 
+	useSparse := folder != "" && contentLength > 500*1024*1024 // 500 MB
+
 	// Warn if large
 	const largeThreshold = 2 * 1024 * 1024 * 1024 // 2 GB
 	if contentLength > largeThreshold {
@@ -96,83 +100,146 @@ func run(cmd *cobra.Command, args []string) {
 		}
 	}
 
-	// GET request for download
-	fmt.Println("\nPobieranie archiwum...")
-	req, err = http.NewRequest("GET", tarURL, nil)
-	if err != nil {
-		fmt.Println(errorStyle.Render("Błąd: Nie można utworzyć zapytania"))
-		os.Exit(1)
-	}
-	if etag != "" {
-		req.Header.Set("If-None-Match", etag)
-	}
-	resp, err = http.DefaultClient.Do(req)
-	if err != nil {
-		fmt.Println(errorStyle.Render("Błąd: Nie można pobrać repozytorium"))
-		os.Exit(1)
-	}
-	if resp.StatusCode == 304 {
-		fmt.Println(successStyle.Render("Folder jest aktualny. Brak zmian."))
-		return
-	}
-	if resp.StatusCode != 200 {
-		fmt.Println(errorStyle.Render("Błąd: Nie można pobrać repozytorium"))
-		os.Exit(1)
-	}
-	newETag := resp.Header.Get("ETag")
-	defer resp.Body.Close()
+	var newETag string
+	var count int
 
-	bar := progressbar.DefaultBytes(
-		resp.ContentLength,
-		"Pobieranie",
-	)
-
-	gzr, err := gzip.NewReader(io.TeeReader(resp.Body, bar))
-	if err != nil {
-		fmt.Println(errorStyle.Render("Błąd: Nie można odczytać archiwum"))
-		os.Exit(1)
-	}
-	tr := tar.NewReader(gzr)
-
-	strip := calculateStrip(repo, branch, folder)
-
-	fmt.Println("\nRozpakowywanie plików...")
-	count := 0
-	for {
-		header, err := tr.Next()
-		if err == io.EOF {
-			break
-		}
+	if useSparse {
+		fmt.Println("\nArchiwum jest duże, przełączam na tryb git sparse-checkout dla efektywnego pobierania...")
+		err = downloadWithSparse(user, repo, branch, folder)
 		if err != nil {
-			fmt.Println(errorStyle.Render("Błąd podczas rozpakowywania"))
+			fmt.Println(errorStyle.Render(fmt.Sprintf("Błąd podczas pobierania sparse: %v", err)))
 			os.Exit(1)
 		}
-
-		// Zastosuj strip-components
-		parts := strings.Split(header.Name, "/")
-		if len(parts) <= strip {
-			continue
-		}
-		target := filepath.Join(parts[strip:]...)
-		if header.Typeflag == tar.TypeDir {
-			os.MkdirAll(target, 0755)
-			continue
-		}
-		os.MkdirAll(filepath.Dir(target), 0755)
-		f, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(header.Mode))
+		// Count after sparse
+		count = countFilesAndFolders(getLastFolder(folder))
+	} else {
+		// GET request for download
+		fmt.Println("\nPobieranie archiwum...")
+		req, err = http.NewRequest("GET", tarURL, nil)
 		if err != nil {
-			fmt.Println(errorStyle.Render("Błąd podczas tworzenia pliku"))
+			fmt.Println(errorStyle.Render("Błąd: Nie można utworzyć zapytania"))
 			os.Exit(1)
 		}
-		io.Copy(f, tr)
-		f.Close()
-		count++
+		if etag != "" {
+			req.Header.Set("If-None-Match", etag)
+		}
+		resp, err = http.DefaultClient.Do(req)
+		if err != nil {
+			fmt.Println(errorStyle.Render("Błąd: Nie można pobrać repozytorium"))
+			os.Exit(1)
+		}
+		if resp.StatusCode == 304 {
+			fmt.Println(successStyle.Render("Folder jest aktualny. Brak zmian."))
+			return
+		}
+		if resp.StatusCode != 200 {
+			fmt.Println(errorStyle.Render("Błąd: Nie można pobrać repozytorium"))
+			os.Exit(1)
+		}
+		newETag = resp.Header.Get("ETag")
+		defer resp.Body.Close()
+
+		bar := progressbar.DefaultBytes(
+			resp.ContentLength,
+			"Pobieranie",
+		)
+
+		gzr, err := gzip.NewReader(io.TeeReader(resp.Body, bar))
+		if err != nil {
+			fmt.Println(errorStyle.Render("Błąd: Nie można odczytać archiwum"))
+			os.Exit(1)
+		}
+		tr := tar.NewReader(gzr)
+
+		strip := calculateStrip(repo, branch, folder)
+
+		fmt.Println("\nRozpakowywanie plików...")
+
+		extractDir := "."
+		atomic := folder != ""
+		if atomic {
+			extractDir, err = os.MkdirTemp("", "ghdir_*")
+			if err != nil {
+				fmt.Println(errorStyle.Render("Błąd: Nie można utworzyć folderu tymczasowego"))
+				os.Exit(1)
+			}
+		}
+
+		extractStrip := strip
+		if atomic {
+			extractStrip++
+		}
+
+		count = 0
+		for {
+			header, err := tr.Next()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				if atomic {
+					os.RemoveAll(extractDir)
+				}
+				fmt.Println(errorStyle.Render("Błąd podczas rozpakowywania"))
+				os.Exit(1)
+			}
+
+			// Zastosuj strip-components
+			parts := strings.Split(header.Name, "/")
+			if len(parts) <= extractStrip {
+				continue
+			}
+			target := filepath.Join(extractDir, filepath.Join(parts[extractStrip:]...))
+			if header.Typeflag == tar.TypeDir {
+				os.MkdirAll(target, 0755)
+				count++ // Liczymy foldery
+				continue
+			}
+			os.MkdirAll(filepath.Dir(target), 0755)
+			f, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(header.Mode))
+			if err != nil {
+				if atomic {
+					os.RemoveAll(extractDir)
+				}
+				fmt.Println(errorStyle.Render("Błąd podczas tworzenia pliku"))
+				os.Exit(1)
+			}
+			io.Copy(f, tr)
+			f.Close()
+			count++
+		}
+
+		if atomic {
+			targetDir := getLastFolder(folder)
+			oldDir := ""
+			if _, err := os.Stat(targetDir); err == nil {
+				oldDir = fmt.Sprintf("%s.old.%d", targetDir, time.Now().Unix())
+				err = os.Rename(targetDir, oldDir)
+				if err != nil {
+					os.RemoveAll(extractDir)
+					fmt.Println(errorStyle.Render("Błąd podczas rename starego folderu"))
+					os.Exit(1)
+				}
+			}
+			err = os.Rename(extractDir, targetDir)
+			if err != nil {
+				if oldDir != "" {
+					os.Rename(oldDir, targetDir)
+				}
+				os.RemoveAll(extractDir)
+				fmt.Println(errorStyle.Render("Błąd podczas atomic rename"))
+				os.Exit(1)
+			}
+			if oldDir != "" {
+				os.RemoveAll(oldDir)
+			}
+		}
 	}
 
 	fmt.Println(successStyle.Render(fmt.Sprintf("\nGotowe! Pobrano %d plików/folderów", count)))
 	fmt.Printf(" → %s\n", successStyle.Render("./"+getLastFolder(folder)))
 
-	// Save new ETag to cache
+	// Save new ETag to cache if archive
 	if newETag != "" {
 		cache[key] = newETag
 		saveCache(cache)
@@ -247,4 +314,83 @@ func saveCache(cache map[string]string) {
 		return
 	}
 	os.WriteFile(file, data, 0644)
+}
+
+func downloadWithSparse(user, repo, branch, folder string) error {
+	tempDir, err := os.MkdirTemp("", "ghdir_*")
+	if err != nil {
+		return err
+	}
+
+	gitURL := fmt.Sprintf("https://github.com/%s/%s.git", user, repo)
+
+	cmds := [][]string{
+		{"git", "clone", "-b", branch, "--filter=blob:none", "--no-checkout", gitURL, tempDir},
+		{"git", "-C", tempDir, "sparse-checkout", "init", "--cone"},
+		{"git", "-C", tempDir, "sparse-checkout", "set", folder},
+		{"git", "-C", tempDir, "checkout", branch},
+	}
+
+	for _, cm := range cmds {
+		c := exec.Command(cm[0], cm[1:]...)
+		c.Stdout = os.Stdout
+		c.Stderr = os.Stderr
+		if err := c.Run(); err != nil {
+			os.RemoveAll(tempDir)
+			return err
+		}
+	}
+
+	err = os.RemoveAll(filepath.Join(tempDir, ".git"))
+	if err != nil {
+		os.RemoveAll(tempDir)
+		return err
+	}
+
+	// Atomic rename
+	targetDir := getLastFolder(folder)
+	folderPath := strings.Replace(folder, "/", string(filepath.Separator), -1)
+	srcDir := filepath.Join(tempDir, folderPath)
+
+	oldDir := ""
+	if _, err := os.Stat(targetDir); err == nil {
+		oldDir = fmt.Sprintf("%s.old.%d", targetDir, time.Now().Unix())
+		err = os.Rename(targetDir, oldDir)
+		if err != nil {
+			os.RemoveAll(tempDir)
+			return err
+		}
+	}
+	err = os.Rename(srcDir, targetDir)
+	if err != nil {
+		if oldDir != "" {
+			os.Rename(oldDir, targetDir)
+		}
+		os.RemoveAll(tempDir)
+		return err
+	}
+	if oldDir != "" {
+		os.RemoveAll(oldDir)
+	}
+	os.RemoveAll(tempDir) // Clean up empty parents
+	return nil
+}
+
+func countFilesAndFolders(dir string) int {
+	count := 0
+	err := filepath.Walk(dir, func(_ string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		count++
+		return nil
+	})
+	if err != nil {
+		return 0
+	}
+	return count - 1 // Subtract root
+}
+
+func main() {
+	Execute()
 }
