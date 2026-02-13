@@ -48,14 +48,11 @@ func run(cmd *cobra.Command, args []string) {
 	if folder != "" {
 		fmt.Printf(" Folder: %s\n", folder)
 	}
-
 	tarURL := fmt.Sprintf("https://github.com/%s/%s/archive/refs/heads/%s.tar.gz", user, repo, branch)
-
 	// Load cache
 	cache := loadCache()
 	key := fmt.Sprintf("%s/%s/%s/%s", user, repo, branch, folder)
 	etag := cache[key]
-
 	// HEAD request for checking ETag and Content-Length
 	fmt.Println("\nSprawdzanie repozytorium...")
 	req, err := http.NewRequest("HEAD", tarURL, nil)
@@ -72,7 +69,6 @@ func run(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 	defer resp.Body.Close()
-
 	if resp.StatusCode == 304 {
 		fmt.Println(successStyle.Render("Folder jest aktualny. Brak zmian."))
 		return
@@ -81,11 +77,8 @@ func run(cmd *cobra.Command, args []string) {
 		fmt.Println(errorStyle.Render("Błąd: Nie można uzyskać dostępu do repozytorium"))
 		os.Exit(1)
 	}
-
 	contentLength := resp.ContentLength
-
 	useSparse := folder != "" && contentLength > 500*1024*1024 // 500 MB
-
 	// Warn if large
 	const largeThreshold = 2 * 1024 * 1024 * 1024 // 2 GB
 	if contentLength > largeThreshold {
@@ -99,10 +92,8 @@ func run(cmd *cobra.Command, args []string) {
 			return
 		}
 	}
-
 	var newETag string
 	var count int
-
 	if useSparse {
 		fmt.Println("\nArchiwum jest duże, przełączam na tryb git sparse-checkout dla efektywnego pobierania...")
 		err = downloadWithSparse(user, repo, branch, folder)
@@ -138,38 +129,31 @@ func run(cmd *cobra.Command, args []string) {
 		}
 		newETag = resp.Header.Get("ETag")
 		defer resp.Body.Close()
-
 		bar := progressbar.DefaultBytes(
 			resp.ContentLength,
 			"Pobieranie",
 		)
-
 		gzr, err := gzip.NewReader(io.TeeReader(resp.Body, bar))
 		if err != nil {
 			fmt.Println(errorStyle.Render("Błąd: Nie można odczytać archiwum"))
 			os.Exit(1)
 		}
 		tr := tar.NewReader(gzr)
-
 		strip := calculateStrip(repo, branch, folder)
-
 		fmt.Println("\nRozpakowywanie plików...")
-
 		extractDir := "."
 		atomic := folder != ""
 		if atomic {
-			extractDir, err = os.MkdirTemp("", "ghdir_*")
+			extractDir, err = os.MkdirTemp(".", "ghdir_*")
 			if err != nil {
 				fmt.Println(errorStyle.Render("Błąd: Nie można utworzyć folderu tymczasowego"))
 				os.Exit(1)
 			}
 		}
-
 		extractStrip := strip
 		if atomic {
 			extractStrip++
 		}
-
 		count = 0
 		for {
 			header, err := tr.Next()
@@ -183,7 +167,6 @@ func run(cmd *cobra.Command, args []string) {
 				fmt.Println(errorStyle.Render("Błąd podczas rozpakowywania"))
 				os.Exit(1)
 			}
-
 			// Zastosuj strip-components
 			parts := strings.Split(header.Name, "/")
 			if len(parts) <= extractStrip {
@@ -208,7 +191,6 @@ func run(cmd *cobra.Command, args []string) {
 			f.Close()
 			count++
 		}
-
 		if atomic {
 			targetDir := getLastFolder(folder)
 			oldDir := ""
@@ -235,10 +217,8 @@ func run(cmd *cobra.Command, args []string) {
 			}
 		}
 	}
-
 	fmt.Println(successStyle.Render(fmt.Sprintf("\nGotowe! Pobrano %d plików/folderów", count)))
 	fmt.Printf(" → %s\n", successStyle.Render("./"+getLastFolder(folder)))
-
 	// Save new ETag to cache if archive
 	if newETag != "" {
 		cache[key] = newETag
@@ -309,7 +289,7 @@ func saveCache(cache map[string]string) {
 	}
 	dir := filepath.Join(configDir, "ghdir")
 	file := filepath.Join(dir, "cache.json")
-	data, err := json.MarshalIndent(cache, "", "  ")
+	data, err := json.MarshalIndent(cache, "", " ")
 	if err != nil {
 		return
 	}
@@ -317,20 +297,17 @@ func saveCache(cache map[string]string) {
 }
 
 func downloadWithSparse(user, repo, branch, folder string) error {
-	tempDir, err := os.MkdirTemp("", "ghdir_*")
+	tempDir, err := os.MkdirTemp(".", "ghdir_*")
 	if err != nil {
 		return err
 	}
-
 	gitURL := fmt.Sprintf("https://github.com/%s/%s.git", user, repo)
-
 	cmds := [][]string{
 		{"git", "clone", "-b", branch, "--filter=blob:none", "--no-checkout", gitURL, tempDir},
 		{"git", "-C", tempDir, "sparse-checkout", "init", "--cone"},
 		{"git", "-C", tempDir, "sparse-checkout", "set", folder},
 		{"git", "-C", tempDir, "checkout", branch},
 	}
-
 	for _, cm := range cmds {
 		c := exec.Command(cm[0], cm[1:]...)
 		c.Stdout = os.Stdout
@@ -340,18 +317,15 @@ func downloadWithSparse(user, repo, branch, folder string) error {
 			return err
 		}
 	}
-
 	err = os.RemoveAll(filepath.Join(tempDir, ".git"))
 	if err != nil {
 		os.RemoveAll(tempDir)
 		return err
 	}
-
 	// Atomic rename
 	targetDir := getLastFolder(folder)
 	folderPath := strings.Replace(folder, "/", string(filepath.Separator), -1)
 	srcDir := filepath.Join(tempDir, folderPath)
-
 	oldDir := ""
 	if _, err := os.Stat(targetDir); err == nil {
 		oldDir = fmt.Sprintf("%s.old.%d", targetDir, time.Now().Unix())
