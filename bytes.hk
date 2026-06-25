@@ -1,3 +1,4 @@
+[project]
 -> name        => "getit"
 -> version     => "1.0.0"
 -> author      => "HackerOS Team <hackeros068@gmail.com>"
