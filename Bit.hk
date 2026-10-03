@@ -1,16 +1,31 @@
-[project]
--> name        => "getit"
--> version     => "1.0.0"
--> author      => "HackerOS Team <hackeros068@gmail.com>"
--> description => "Universal download and repository management tool"
--> license     => "Apache-2.0"
--> edition     => "2026"
+[package]
+-> name        => getit
+-> version     => 1.0.0
+-> description => Universal download and repository management tool
+-> authors     => ["HackerOS Team <hackeros068@gmail.com>"]
+-> license     => BSD-3-Clause
+-> lang        => h#
 
-[[bin]]
--> name => "getit"
--> path => "src/main.h#"
+[layout]
+-> src => src
 
-[profile.release]
--> opt-level => "speed"
--> strip     => true
--> lto       => true
+[build]
+-> link => static
+
+[default-build]
+-> profile => release
+-> emit    => bin
+
+! getit uses only the H# standard library, so there are no dependencies
+[dependencies]
+
+[commands]
+-> check
+--> run => bit check
+--> description => Type-check every module
+-> install-local
+--> run => install -Dm755 cache/build/release/getit /usr/bin/getit
+--> description => Install the release binary to /usr/bin
+
+[hooks]
+-> pre-build => echo "building getit (static)"
