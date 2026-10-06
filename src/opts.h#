@@ -1,0 +1,119 @@
+pub struct Opts is
+    pub oo_pos:     [string]   ;; positional arguments (URLs)
+    pub oo_out:     string     ;; -o  file or folder name
+    pub oo_dir:     string     ;; -d  parent directory of the result
+    pub oo_ref:     string     ;; -b  branch / tag / commit
+    pub oo_sha:     string     ;; --sha256 expected checksum
+    pub oo_action:  string     ;; repo: clone | push
+    pub oo_depth:   int        ;; repo --depth
+    pub oo_force:   bool
+    pub oo_merge:   bool
+    pub oo_yes:     bool
+    pub oo_dry:     bool
+    pub oo_quiet:   bool
+    pub oo_verbose: bool
+    pub oo_sparse:  bool
+    pub oo_help:    bool
+    pub oo_bad:     string     ;; "" or a message about a wrong option
+end
+
+fn arg_at(arr: [string], i: int) -> string is
+    if i < array_len(arr) is return arr[i] end
+    return ""
+end
+
+;; Understands `-o x`, `--output x` and `--output=x`; everything after `--` is positional.
+pub fn parse(args: [string], start: int) -> Opts is
+    let argc: int = array_len(args)
+    let mut pos: [string] = []
+    let mut out: string = ""
+    let mut dir: string = ""
+    let mut gref: string = ""
+    let mut sha: string = ""
+    let mut action: string = ""
+    let mut bad: string = ""
+    let mut depth: int = 0
+    let mut force: bool = false
+    let mut merge: bool = false
+    let mut yes: bool = false
+    let mut dry: bool = false
+    let mut quiet: bool = false
+    let mut verbose: bool = false
+    let mut sparse: bool = false
+    let mut help: bool = false
+    let mut only_pos: bool = false
+
+    let mut i: int = start
+    while i < argc is
+        let a: string = args[i]
+        let mut key: string = a
+        let mut inl: string = ""
+        let mut has_inl: bool = false
+        let eq: int = string_find(a, "=")
+        if string_starts_with(a, "--") && eq > 2 is
+            key = string_slice(a, 0, eq)
+            inl = string_slice(a, eq + 1, string_len(a))
+            has_inl = true
+        end
+
+        if only_pos || !string_starts_with(a, "-") || a == "-" is
+            pos = array_push(pos, a)
+        else if key == "--" is
+            only_pos = true
+        else if key == "-o" || key == "--output" || key == "--out" || key == "--name" is
+            if !has_inl is i += 1 end
+            out = if has_inl then inl else arg_at(args, i)
+            if out == "" is bad = key + " wymaga wartości" end
+        else if key == "-d" || key == "--dir" || key == "--into" is
+            if !has_inl is i += 1 end
+            dir = if has_inl then inl else arg_at(args, i)
+            if dir == "" is bad = key + " wymaga wartości" end
+        else if key == "-b" || key == "--branch" || key == "--ref" || key == "--tag" is
+            if !has_inl is i += 1 end
+            gref = if has_inl then inl else arg_at(args, i)
+            if gref == "" is bad = key + " wymaga wartości" end
+        else if key == "--sha256" || key == "--checksum" is
+            if !has_inl is i += 1 end
+            let shav: string = if has_inl then inl else arg_at(args, i)
+            sha = string_lower(shav)
+            if sha == "" is bad = key + " wymaga wartości" end
+        else if key == "--depth" is
+            if !has_inl is i += 1 end
+            let dv: string = if has_inl then inl else arg_at(args, i)
+            depth = str_to_int(dv)
+            if depth < 1 is bad = "--depth wymaga liczby >= 1" end
+        else if key == "-f" || key == "--force" || key == "--overwrite" is
+            force = true
+        else if key == "-m" || key == "--merge" is
+            merge = true
+        else if key == "-y" || key == "--yes" is
+            yes = true
+        else if key == "-n" || key == "--dry-run" is
+            dry = true
+        else if key == "-q" || key == "--quiet" is
+            quiet = true
+        else if key == "-v" || key == "--verbose" is
+            verbose = true
+        else if key == "--sparse" is
+            sparse = true
+        else if key == "-h" || key == "--help" is
+            help = true
+        else if key == "-clone" || key == "--clone" || key == "-c" is
+            action = "clone"
+        else if key == "-push" || key == "--push" || key == "-p" is
+            action = "push"
+        else if key == "--no-color" is
+            env_set("GETIT_NO_COLOR", "1")
+        else is
+            bad = "Nieznana opcja '" + a + "'"
+        end
+        i += 1
+    end
+
+    return Opts {
+        oo_pos: pos, oo_out: out, oo_dir: dir, oo_ref: gref, oo_sha: sha,
+        oo_action: action, oo_depth: depth, oo_force: force, oo_merge: merge,
+        oo_yes: yes, oo_dry: dry, oo_quiet: quiet, oo_verbose: verbose,
+        oo_sparse: sparse, oo_help: help, oo_bad: bad
+    }
+end
