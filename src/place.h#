@@ -1,0 +1,66 @@
+mod util
+mod ui
+mod opts
+
+;; ── place.h# ─ where the result goes and what to do when it already exists ──
+
+;; final path = [-d DIR/] + (-o NAME | default name)
+pub fn target(o: opts::Opts, label: string) -> string is
+    let name: string = if o.oo_out != "" then o.oo_out else label
+    if o.oo_dir != "" && !string_starts_with(name, "/") is
+        return util::trim_slashes(o.oo_dir) + "/" + name
+    end
+    return name
+end
+
+;; new | replace | merge | abort
+pub fn resolve_mode(dest: string, o: opts::Opts, is_dir: bool) -> string is
+    if !util::exists(dest) is return "new" end
+    if dest == "." || dest == "./" is return "merge" end
+    if o.oo_merge && is_dir is return "merge" end
+    if o.oo_force || o.oo_yes is
+        if util::is_protected(dest) is
+            ui::fail("Odmawiam nadpisania '" + dest + "' (to katalog domowy, bieżący lub główny).")
+            ui::hint("Użyj --merge, żeby dołożyć pliki do istniejącego katalogu.")
+            return "abort"
+        end
+        return "replace"
+    end
+    if util::tty_in() is
+        let what: string = if is_dir then "Katalog" else "Plik"
+        let a: string = util::ask(" ? " + what + " '" + dest + "' już istnieje. [n]adpisz / " + (if is_dir then "[s]cal / " else "") + "[a]nuluj (domyślnie: anuluj): ")
+        if a == "n" || a == "nadpisz" is
+            if util::is_protected(dest) is
+                ui::fail("Odmawiam nadpisania '" + dest + "'.")
+                return "abort"
+            end
+            return "replace"
+        end
+        if (a == "s" || a == "scal") && is_dir is return "merge" end
+        return "abort"
+    end
+    ui::fail("'" + dest + "' już istnieje.")
+    ui::hint("Dodaj --force (nadpisz)" + (if is_dir then ", --merge (scal)" else "") + " albo wybierz inną nazwę: -o NAZWA")
+    return "abort"
+end
+
+;; puts `src` (file or folder, usually in a scratch dir) at `dest`
+pub fn apply(src: string, dest: string, mode: string) -> int is
+    if mode == "merge" && dir_exists(src) is
+        util::mkdir_p(dest)
+        return util::run("cp -a " + util::sq(src) + "/. " + util::sq(dest) + "/")
+    end
+    util::mkdir_p(util::dirname(dest))
+    if mode == "replace" is
+        let old: string = dest + ".getit-old"
+        util::rm_rf(old)
+        if util::run("mv " + util::sq(dest) + " " + util::sq(old)) != 0 is return 1 end
+        if util::run("mv " + util::sq(src) + " " + util::sq(dest)) != 0 is
+            util::run("mv " + util::sq(old) + " " + util::sq(dest))
+            return 1
+        end
+        util::rm_rf(old)
+        return 0
+    end
+    return util::run("mv " + util::sq(src) + " " + util::sq(dest))
+end
