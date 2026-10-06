@@ -1,0 +1,232 @@
+mod util
+mod fetch
+
+;; ── link.h# ─ understands what the user pasted ───────────────────────────────
+;;
+;; Accepts full URLs (github / gitlab / codeberg-gitea / raw / gist / any other),
+;; ssh-style `git@host:user/repo.git` and the shorthand `user/repo[/tree/...]`.
+;; The result says *what* the link points to, so getit can pick file / dir / repo
+;; on its own and, above all, never downloads a GitHub "blob" HTML page again.
+
+pub struct Link is
+    pub lk_ok:    bool
+    pub lk_url:   string    ;; normalised https URL (query kept for plain files)
+    pub lk_host:  string
+    pub lk_kind:  string    ;; github | gitlab | gitea | other
+    pub lk_proj:  string    ;; user/repo (gitlab: group/sub/repo)
+    pub lk_user:  string
+    pub lk_repo:  string
+    pub lk_mode:  string    ;; repo | tree | blob | node | file
+    pub lk_rest:  string    ;; "<ref>/<path>" – not split yet (refs may contain '/')
+    pub lk_gkind: string    ;; gitea: branch | tag | commit
+    pub lk_git:   bool      ;; the link explicitly ended with ".git"
+end
+
+pub struct Ref is
+    pub rf_ref:  string     ;; "" = default branch
+    pub rf_path: string     ;; path inside the repository ("" = whole repo)
+end
+
+fn mk(url: string, host: string, kind: string, proj: string, user: string, repo: string, mode: string, rest: string, gkind: string, git: bool) -> Link is
+    return Link {
+        lk_ok: true, lk_url: url, lk_host: host, lk_kind: kind, lk_proj: proj,
+        lk_user: user, lk_repo: repo, lk_mode: mode, lk_rest: rest,
+        lk_gkind: gkind, lk_git: git
+    }
+end
+
+fn invalid(url: string) -> Link is
+    return Link {
+        lk_ok: false, lk_url: url, lk_host: "", lk_kind: "", lk_proj: "",
+        lk_user: "", lk_repo: "", lk_mode: "", lk_rest: "", lk_gkind: "", lk_git: false
+    }
+end
+
+;; turns whatever the user typed into https://host/path (or "" when hopeless)
+fn normalize(raw: string) -> string is
+    let s: string = string_trim(raw)
+    if s == "" is return "" end
+    if string_starts_with(s, "http://") || string_starts_with(s, "https://") is return s end
+    if string_starts_with(s, "git@") is
+        let at: int = string_find(s, ":")
+        if at < 0 is return "" end
+        return "https://" + string_slice(s, 4, at) + "/" + string_slice(s, at + 1, string_len(s))
+    end
+    if string_starts_with(s, "ssh://git@") is return "https://" + string_slice(s, 10, string_len(s)) end
+    if string_starts_with(s, "git://") is return "https://" + string_slice(s, 6, string_len(s)) end
+    if !string_contains(s, "/") is return "" end
+    let parts: [string] = string_split(s, "/")
+    let first: string = parts[0]
+    if string_contains(first, ".") is return "https://" + s end
+    if string_contains(first, ":") is return "" end
+    return "https://github.com/" + s
+end
+
+fn strip_git(name: string) -> string is
+    if string_ends_with(name, ".git") is return string_slice(name, 0, string_len(name) - 4) end
+    return name
+end
+
+pub fn parse(raw: string) -> Link is
+    let s0: string = normalize(raw)
+    if s0 == "" is return invalid(raw) end
+    let s: string = util::cut_at(s0, "#")
+    let rest0: string = if string_starts_with(s, "https://") then string_slice(s, 8, string_len(s)) else string_slice(s, 7, string_len(s))
+    let q: int = string_find(rest0, "?")
+    let body: string = util::trim_slashes(if q >= 0 then string_slice(rest0, 0, q) else rest0)
+    let segs: [string] = string_split(body, "/")
+    let n: int = array_len(segs)
+    let host: string = string_lower(segs[0])
+    let web: string = "https://" + body
+
+    if host == "github.com" || host == "www.github.com" is
+        if n < 3 is return invalid(raw) end
+        let user: string = segs[1]
+        let repo: string = strip_git(segs[2])
+        let git: bool = string_ends_with(segs[2], ".git")
+        let proj: string = user + "/" + repo
+        if n == 3 is return mk(web, "github.com", "github", proj, user, repo, "repo", "", "", git) end
+        let sec: string = segs[3]
+        let rest: string = util::join_from(segs, 4, "/")
+        if (sec == "tree") && rest != "" is return mk(web, "github.com", "github", proj, user, repo, "tree", rest, "", false) end
+        if (sec == "blob" || sec == "raw") && rest != "" is return mk(web, "github.com", "github", proj, user, repo, "blob", rest, "", false) end
+        if sec == "releases" && n > 4 && segs[4] == "download" is return mk(web, "github.com", "github", proj, user, repo, "file", "", "", false) end
+        if sec == "archive" is return mk(web, "github.com", "github", proj, user, repo, "file", "", "", false) end
+        return mk(web, "github.com", "github", proj, user, repo, "repo", "", "", git)
+    end
+
+    if host == "raw.githubusercontent.com" is
+        if n < 5 is return invalid(raw) end
+        return mk(web, "github.com", "github", segs[1] + "/" + segs[2], segs[1], segs[2], "file", util::join_from(segs, 3, "/"), "", false)
+    end
+
+    if host == "gist.github.com" is
+        if n < 2 is return invalid(raw) end
+        let url: string = if n == 2 then "https://gist.github.com/" + segs[1] + "/raw" else "https://gist.github.com/" + segs[1] + "/" + segs[2] + "/raw"
+        return mk(url, "gist.github.com", "github", "", segs[1], "", "file", "", "", false)
+    end
+
+    if host == "gitlab.com" || string_starts_with(host, "gitlab.") is
+        if n < 3 is return invalid(raw) end
+        let mut dash: int = -1
+        let mut i: int = 1
+        while i < n is
+            if segs[i] == "-" && dash < 0 is dash = i end
+            i += 1
+        end
+        let pend: int = if dash > 0 then dash else n
+        let mut parts: [string] = []
+        let mut j: int = 1
+        while j < pend is
+            parts = array_push(parts, segs[j])
+            j += 1
+        end
+        let last: string = strip_git(parts[array_len(parts) - 1])
+        let proj: string = strip_git(util::join_from(parts, 0, "/"))
+        let git: bool = string_ends_with(parts[array_len(parts) - 1], ".git")
+        if dash > 0 && dash + 2 < n is
+            let kind: string = segs[dash + 1]
+            let rest: string = util::join_from(segs, dash + 2, "/")
+            if kind == "tree" is return mk(web, host, "gitlab", proj, parts[0], last, "tree", rest, "", false) end
+            if kind == "blob" || kind == "raw" is return mk(web, host, "gitlab", proj, parts[0], last, "blob", rest, "", false) end
+        end
+        return mk(web, host, "gitlab", proj, parts[0], last, "repo", "", "", git)
+    end
+
+    if host == "codeberg.org" || string_contains(host, "gitea") || string_contains(host, "forgejo") is
+        if n < 3 is return invalid(raw) end
+        let user: string = segs[1]
+        let repo: string = strip_git(segs[2])
+        let git: bool = string_ends_with(segs[2], ".git")
+        let proj: string = user + "/" + repo
+        if n >= 6 is
+            let sec: string = segs[3]
+            let gk: string = segs[4]
+            let rest: string = util::join_from(segs, 5, "/")
+            if sec == "src" is return mk(web, host, "gitea", proj, user, repo, "node", rest, gk, false) end
+            if sec == "raw" is return mk(web, host, "gitea", proj, user, repo, "blob", rest, gk, false) end
+        end
+        if n > 4 && segs[3] == "releases" && segs[4] == "download" is return mk(web, host, "gitea", proj, user, repo, "file", "", "", false) end
+        return mk(web, host, "gitea", proj, user, repo, "repo", "", "", git)
+    end
+
+    ;; any other server: a plain file, unless it is clearly a git remote
+    if string_ends_with(body, ".git") && n >= 3 is
+        let repo: string = strip_git(segs[n - 1])
+        return mk(web, host, "other", util::join_from(segs, 1, "/"), segs[1], repo, "repo", "", "", true)
+    end
+    return mk(s, host, "other", "", "", "", "file", "", "", false)
+end
+
+;; direct download URL of a file link
+pub fn file_url(l: Link) -> string is
+    if l.lk_mode == "file" is return l.lk_url end
+    if l.lk_kind == "github" is return "https://github.com/" + l.lk_proj + "/raw/" + l.lk_rest end
+    if l.lk_kind == "gitlab" is return "https://" + l.lk_host + "/" + l.lk_proj + "/-/raw/" + l.lk_rest end
+    if l.lk_kind == "gitea" is return "https://" + l.lk_host + "/" + l.lk_proj + "/raw/" + l.lk_gkind + "/" + l.lk_rest end
+    return l.lk_url
+end
+
+;; a sensible file name for a file link
+pub fn file_name(l: Link) -> string is
+    let src: string = if l.lk_mode == "blob" then l.lk_rest else util::cut_at(util::cut_at(l.lk_url, "?"), "#")
+    let name: string = util::url_decode(util::basename(src))
+    if name == "" || name == l.lk_host is
+        if l.lk_host == "gist.github.com" is return "gist.txt" end
+        if l.lk_mode == "file" && l.lk_kind == "other" is return "index.html" end
+    end
+    if name == "raw" && l.lk_host == "gist.github.com" is return "gist.txt" end
+    return name
+end
+
+pub fn clone_url(l: Link) -> string is
+    return "https://" + l.lk_host + "/" + l.lk_proj + ".git"
+end
+
+;; codeberg "src" links can be a file or a folder: ask the server
+pub fn settle(l: Link) -> Link is
+    if !l.lk_ok || l.lk_mode != "node" is return l end
+    let probe_l: Link = mk(l.lk_url, l.lk_host, l.lk_kind, l.lk_proj, l.lk_user, l.lk_repo, "blob", l.lk_rest, l.lk_gkind, false)
+    let code: string = fetch::probe(file_url(probe_l))
+    if fetch::good(code) is return probe_l end
+    return mk(l.lk_url, l.lk_host, l.lk_kind, l.lk_proj, l.lk_user, l.lk_repo, "tree", l.lk_rest, l.lk_gkind, false)
+end
+
+;; what getit should do by default: file | dir | repo
+pub fn classify(l: Link) -> string is
+    if l.lk_mode == "blob" || l.lk_mode == "file" || l.lk_mode == "node" is return "file" end
+    if l.lk_mode == "tree" is return "dir" end
+    if l.lk_git is return "repo" end
+    return "dir"
+end
+
+;; Splits "<ref>/<path>". Branch names may contain '/', so when the first segment
+;; is not obviously the whole ref we ask the remote for its branches and tags and
+;; take the longest one that prefixes the rest. `forced` (-b) overrides the ref.
+pub fn resolve(l: Link, forced: string) -> Ref is
+    let rest: string = l.lk_rest
+    let mut gref: string = ""
+    let mut gpath: string = ""
+    if rest != "" is
+        let segs: [string] = string_split(rest, "/")
+        let first: string = segs[0]
+        gref = first
+        gpath = util::join_from(segs, 1, "/")
+        if array_len(segs) > 1 && first != "main" && first != "master" is
+            let names: [string] = fetch::remote_refs(clone_url(l))
+            let mut best: string = ""
+            let mut i: int = 0
+            while i < array_len(names) is
+                let nm: string = names[i]
+                if (rest == nm || string_starts_with(rest, nm + "/")) && string_len(nm) > string_len(best) is best = nm end
+                i += 1
+            end
+            if best != "" is
+                gref = best
+                gpath = if rest == best then "" else string_slice(rest, string_len(best) + 1, string_len(rest))
+            end
+        end
+    end
+    if forced != "" is gref = forced end
+    return Ref { rf_ref: gref, rf_path: gpath }
+end
