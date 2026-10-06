@@ -1,6 +1,6 @@
 [package]
 -> name        => getit
--> version     => 1.0.0
+-> version     => 0.5.0
 -> description => Universal download and repository management tool
 -> authors     => ["HackerOS Team <hackeros068@gmail.com>"]
 -> license     => BSD-3-Clause
@@ -16,13 +16,16 @@
 -> profile => release
 -> emit    => bin
 
-! getit uses only the H# standard library, so there are no dependencies
+! getit uses only H# builtins (plus curl/tar/git at run time), so there are no dependencies
 [dependencies]
 
 [commands]
 -> check
 --> run => bit check
 --> description => Type-check every module
+-> smoke
+--> run => sh tests/smoke.sh cache/build/release/getit
+--> description => Run the network smoke tests against the release binary
 -> install-local
 --> run => install -Dm755 cache/build/release/getit /usr/bin/getit
 --> description => Install the release binary to /usr/bin
