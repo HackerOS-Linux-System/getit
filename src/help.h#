@@ -1,0 +1,56 @@
+mod ui
+
+;; ── help.h# ─ usage texts ────────────────────────────────────────────────────
+
+pub fn version() is
+    write("getit 0.5.0")
+end
+
+pub fn usage() is
+    write(ui::teal("getit") + " – pobieranie plików, folderów i repozytoriów z GitHub / GitLab / Codeberg")
+    write("")
+    write(ui::bold("Użycie:"))
+    write("  getit <link>                      sam rozpozna: plik, folder czy repozytorium")
+    write("  getit file <link>...              pobierz plik(i)")
+    write("  getit dir  <link>                 pobierz folder (lub całe repo bez historii)")
+    write("  getit repo <link> [--clone|--push] sklonuj repozytorium / wyślij zmiany")
+    write("  getit info <link>                 pokaż jak getit rozumie link")
+    write("  getit doctor                      sprawdź narzędzia i połączenie")
+    write("")
+    write(ui::bold("Linki mogą mieć postać:"))
+    write("  https://github.com/user/repo/blob/main/plik.txt   (strona pliku – bierze raw)")
+    write("  https://github.com/user/repo/tree/main/src        (folder)")
+    write("  user/repo/tree/main/src                            (skrót = GitHub)")
+    write("")
+    write(ui::bold("Opcje:"))
+    write("  -o NAZWA     nazwa pliku/folderu wyniku        -d KATALOG   gdzie zapisać wynik")
+    write("  -b REF       gałąź / tag                       -f, --force  nadpisz bez pytania")
+    write("  -m, --merge  scal z istniejącym folderem       -y, --yes    odpowiadaj „tak”")
+    write("  -n, --dry-run tylko pokaż co zostanie zrobione -q, --quiet  tylko komunikaty błędów")
+    write("  --sparse     folder przez git sparse-checkout  --sha256 SUMA sprawdź sumę pliku")
+    write("  --depth N    głębokość klonu (repo)            --no-color   bez kolorów")
+    write("")
+    write(ui::bold("Zmienne:") + "  GITHUB_TOKEN / GITLAB_TOKEN / CODEBERG_TOKEN (prywatne repo, wyższe limity)")
+    write("Więcej: getit help file | dir | repo")
+end
+
+pub fn show(topic: string) is
+    if topic == "file" is
+        write(ui::bold("getit file") + " <link>... [-o NAZWA|KATALOG/] [-d KATALOG] [--sha256 SUMA] [-f]")
+        write("  Pobiera plik. Link do strony pliku (blob) jest zamieniany na raw automatycznie.")
+        write("  Gdy podasz link do folderu, getit sam przełączy się na 'dir'.")
+        write("  Przykład: getit file https://github.com/u/r/blob/main/Bit.hk")
+    else if topic == "dir" is
+        write(ui::bold("getit dir") + " <link> [-o NAZWA] [-d KATALOG] [-b REF] [-f | -m] [--sparse]")
+        write("  Pobiera folder z repozytorium. Link bez /tree/... pobiera całe repo.")
+        write("  -o . (lub -m) wrzuca zawartość do bieżącego katalogu.")
+        write("  Gdy podasz link do pliku, getit sam przełączy się na 'file'.")
+        write("  Przykład: getit dir https://github.com/u/r/tree/main/src")
+    else if topic == "repo" is
+        write(ui::bold("getit repo") + " <link> [--clone | --push] [-b REF] [--depth N] [-o NAZWA]")
+        write("  --clone (domyślnie) klonuje; --push wysyła bieżącą gałąź pod wskazany adres")
+        write("  bez zmieniania konfiguracji remote. Obsługuje też git@host:user/repo.git.")
+    else is
+        usage()
+    end
+end
