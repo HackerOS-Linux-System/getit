@@ -1,0 +1,237 @@
+mod util
+mod ui
+
+;; ── fetch.h# ─ everything that talks to the network ──────────────────────────
+;;
+;; HTTP results are handled as the *string* printed by curl's %{http_code}
+;; ("200", "404", "000" = no connection). Comparing strings avoids the integer
+;; comparison that made getit 1.x print "status 200" as an error.
+
+;; name of the env var holding a token for this URL's host, "" when none is set
+pub fn token_var(url: string) -> string is
+    if string_contains(url, "github") is
+        if env_get("GITHUB_TOKEN") != "" is return "GITHUB_TOKEN" end
+        if env_get("GH_TOKEN") != "" is return "GH_TOKEN" end
+        return ""
+    end
+    if string_contains(url, "gitlab") is
+        if env_get("GITLAB_TOKEN") != "" is return "GITLAB_TOKEN" end
+        return ""
+    end
+    if string_contains(url, "codeberg") is
+        if env_get("CODEBERG_TOKEN") != "" is return "CODEBERG_TOKEN" end
+    end
+    return ""
+end
+
+;; extra curl arguments; the token is expanded by the shell, never printed by getit
+pub fn auth_args(url: string) -> string is
+    let v: string = token_var(url)
+    if v == "" is return "" end
+    if string_contains(url, "gitlab") is
+        return " -H \"PRIVATE-TOKEN: $" + v + "\""
+    end
+    if string_contains(url, "codeberg") is
+        return " -H \"Authorization: token $" + v + "\""
+    end
+    return " -H \"Authorization: Bearer $" + v + "\""
+end
+
+;; extra git arguments for https authentication
+pub fn git_auth(url: string) -> string is
+    let v: string = token_var(url)
+    if v == "" is return "" end
+    let user: string = if string_contains(url, "gitlab") then "oauth2" else "x-access-token"
+    return " -c \"http.extraHeader=Authorization: Basic $(printf '" + user + ":%s' \"$" + v + "\" | base64 | tr -d '\\n')\""
+end
+
+pub fn good(code: string) -> bool is
+    return string_starts_with(code, "2")
+end
+
+;; Downloads `url` to `dest` and returns the HTTP code ("000" = network failure,
+;; "none" = neither curl nor wget installed). `dest` is only created on success.
+pub fn get(url: string, dest: string, show: bool) -> string is
+    if util::tool_exists("curl") is
+        let codef: string = dest + ".code"
+        let bar: string = if show && util::tty_err() then "-#" else "-s"
+        let cmd: string = "curl -f -L " + bar + " --retry 3 --retry-delay 2 --connect-timeout 20 -A 'getit/2.0'" + auth_args(url) + " -o " + util::sq(dest) + " -w '%{{http_code}}' " + util::sq(url) + " > " + util::sq(codef)
+        let rc: int = util::run(cmd)
+        let mut code: string = string_trim(file_read(codef))
+        util::run("rm -f " + util::sq(codef))
+        if code == "" is code = "000" end
+        if rc != 0 && good(code) is code = "000" end
+        if rc == 0 && !good(code) is code = "200" end
+        return code
+    end
+    if util::tool_exists("wget") is
+        let rc: int = util::run("wget -q --show-progress -O " + util::sq(dest) + " " + util::sq(url))
+        if rc == 0 is return "200" end
+        util::run("rm -f " + util::sq(dest))
+        return "000"
+    end
+    return "none"
+end
+
+;; HTTP status of a URL without downloading it (asks for the first byte only)
+pub fn probe(url: string) -> string is
+    if !util::tool_exists("curl") is return "none" end
+    let code: string = util::capture("curl -s -L -o /dev/null --max-time 20 -r 0-0 -A 'getit/2.0'" + auth_args(url) + " -w '%{{http_code}}' " + util::sq(url) + " 2>/dev/null")
+    if code == "" is return "000" end
+    return code
+end
+
+;; "content-type size" of a URL, for `getit info`
+pub fn describe(url: string) -> string is
+    if !util::tool_exists("curl") is return "" end
+    return util::capture("curl -s -L -o /dev/null --max-time 20 -r 0-0 -A 'getit/2.0'" + auth_args(url) + " -w '%{{content_type}}' " + util::sq(url) + " 2>/dev/null")
+end
+
+;; prints a human explanation of a failed download
+pub fn explain(code: string, url: string) is
+    if code == "404" is
+        ui::fail("Nie znaleziono (404) – zły adres, nazwa gałęzi albo brak uprawnień.")
+        if string_contains(url, "github") || string_contains(url, "gitlab") || string_contains(url, "codeberg") is
+            ui::hint("Sprawdź link i nazwę gałęzi. Dla prywatnych repozytoriów ustaw GITHUB_TOKEN (lub GITLAB_TOKEN).")
+        else is
+            ui::hint("Sprawdź czy adres jest poprawny.")
+        end
+    else if (code == "401" || code == "403") && (string_contains(url, "github") || string_contains(url, "gitlab") || string_contains(url, "codeberg")) is
+        ui::fail("Brak dostępu (" + code + ") – prywatne repozytorium albo limit zapytań API.")
+        ui::hint("Ustaw zmienną GITHUB_TOKEN (GITLAB_TOKEN / CODEBERG_TOKEN) i spróbuj ponownie.")
+    else if code == "401" || code == "403" is
+        ui::fail("Serwer odmówił dostępu (" + code + ").")
+        ui::hint("Sprawdź czy link jest publiczny i czy proxy/firewall nie blokuje połączenia.")
+    else if code == "429" is
+        ui::fail("Serwer ogranicza liczbę zapytań (429).")
+        ui::hint("Odczekaj chwilę albo użyj tokena (GITHUB_TOKEN).")
+    else if code == "000" is
+        ui::fail("Brak połączenia z serwerem (sprawdź sieć, DNS lub proxy).")
+        ui::hint("Diagnostyka: getit doctor")
+    else if code == "none" is
+        ui::fail("Brak programu curl i wget.")
+        ui::hint("Zainstaluj curl:  apt install curl")
+    else is
+        ui::fail("Serwer odpowiedział kodem " + code + ".")
+    end
+end
+
+;; does the beginning of the file look like an HTML page?
+pub fn looks_html(path: string) -> bool is
+    let n: string = util::capture("head -c 600 " + util::sq(path) + " 2>/dev/null | tr 'A-Z' 'a-z' | grep -c -e '<!doctype html' -e '<html'")
+    return str_to_int(n) > 0
+end
+
+pub fn verify_sha(path: string, expected: string) -> bool is
+    let mut tool: string = ""
+    if util::tool_exists("sha256sum") is tool = "sha256sum"
+    else if util::tool_exists("shasum") is tool = "shasum -a 256" end
+    if tool == "" is return false end
+    let got: string = util::capture(tool + " " + util::sq(path) + " 2>/dev/null | cut -d' ' -f1")
+    return string_lower(got) == string_lower(expected)
+end
+
+;; repository size in KB according to the GitHub API (0 when unknown)
+pub fn github_size_kb(user: string, repo: string) -> int is
+    if !util::tool_exists("curl") is return 0 end
+    let api: string = "https://api.github.com/repos/" + user + "/" + repo
+    let out: string = util::capture("curl -s -m 8 -A 'getit/2.0'" + auth_args(api) + " " + util::sq(api) + " 2>/dev/null | grep -m1 '\"size\":' | tr -dc '0-9'")
+    return str_to_int(out)
+end
+
+;; names of branches and tags of a remote (empty when git is missing / no access)
+pub fn remote_refs(url: string) -> [string] is
+    let none: [string] = []
+    if !util::tool_exists("git") is return none end
+    let out: string = util::capture("GIT_TERMINAL_PROMPT=0 git" + git_auth(url) + " ls-remote --heads --tags " + util::sq(url) + " 2>/dev/null | cut -f2 | grep -v '\\^' | sed -e 's#^refs/heads/##' -e 's#^refs/tags/##'")
+    if out == "" is return none end
+    return string_split(out, "\n")
+end
+
+;; candidate archive URLs for a GitHub ref ("" = default branch)
+pub fn archive_urls(user: string, repo: string, gref: string) -> [string] is
+    let mut urls: [string] = []
+    let base: string = "https://github.com/" + user + "/" + repo
+    if token_var(base) != "" is
+        let api: string = "https://api.github.com/repos/" + user + "/" + repo + "/tarball"
+        let mut one: string = api
+        if gref != "" is one = api + "/" + gref end
+        urls = array_push(urls, one)
+        return urls
+    end
+    if gref == "" is
+        urls = array_push(urls, base + "/archive/HEAD.tar.gz")
+        return urls
+    end
+    urls = array_push(urls, base + "/archive/refs/heads/" + gref + ".tar.gz")
+    urls = array_push(urls, base + "/archive/refs/tags/" + gref + ".tar.gz")
+    urls = array_push(urls, base + "/archive/" + gref + ".tar.gz")
+    return urls
+end
+
+;; downloads the repo archive and unpacks it (without the top folder) to <tmp>/x
+pub fn tarball(user: string, repo: string, gref: string, tmp: string) -> int is
+    let urls: [string] = archive_urls(user, repo, gref)
+    let tgz: string = tmp + "/src.tgz"
+    ui::step("Pobieranie archiwum…")
+    let mut last: string = "000"
+    let mut last_url: string = urls[0]
+    let mut done: bool = false
+    let mut i: int = 0
+    while i < array_len(urls) && !done is
+        last_url = urls[i]
+        last = get(urls[i], tgz, true)
+        if good(last) is done = true end
+        i += 1
+    end
+    if !done is
+        explain(last, last_url)
+        return 1
+    end
+    ui::step("Rozpakowywanie…")
+    util::mkdir_p(tmp + "/x")
+    let rc: int = util::run("tar -xzf " + util::sq(tgz) + " -C " + util::sq(tmp + "/x") + " --strip-components=1 2>/dev/null")
+    util::run("rm -f " + util::sq(tgz))
+    if rc != 0 is
+        ui::fail("Archiwum jest uszkodzone albo nie jest plikiem tar.gz.")
+        return 1
+    end
+    return 0
+end
+
+;; shallow clone (sparse when `gpath` is given) into <tmp>/x, .git removed
+pub fn git_checkout(url: string, gref: string, gpath: string, tmp: string) -> int is
+    if !util::tool_exists("git") is
+        ui::fail("Ten tryb wymaga programu git.")
+        ui::hint("Zainstaluj git:  apt install git")
+        return 1
+    end
+    let root: string = tmp + "/x"
+    let g: string = "GIT_TERMINAL_PROMPT=0 git" + git_auth(url)
+    let prog: string = if util::tty_err() && !ui::quiet() then "--progress" else "--quiet"
+    let br: string = if gref != "" then " --branch " + util::sq(gref) else ""
+    let filt: string = if gpath != "" then " --filter=blob:none --no-checkout" else ""
+    ui::step("Klonowanie (git, depth 1)…")
+    let rc: int = util::run(g + " clone " + prog + " --depth=1" + filt + br + " " + util::sq(url) + " " + util::sq(root))
+    if rc != 0 is
+        ui::fail("git clone nie powiódł się.")
+        ui::hint("Sprawdź adres i nazwę gałęzi/tagu (commit SHA nie jest obsługiwany w tym trybie).")
+        return 1
+    end
+    if gpath != "" is
+        let r1: int = util::run("git -C " + util::sq(root) + " sparse-checkout set --no-cone " + util::sq("/" + gpath) + " >/dev/null 2>&1")
+        if r1 != 0 is
+            util::run("git -C " + util::sq(root) + " sparse-checkout init --cone >/dev/null 2>&1")
+            util::run("git -C " + util::sq(root) + " sparse-checkout set " + util::sq(gpath) + " >/dev/null 2>&1")
+        end
+        let head: string = util::capture("git -C " + util::sq(root) + " symbolic-ref --short HEAD 2>/dev/null")
+        let target: string = if head != "" then head else "HEAD"
+        let r2: int = util::run("git -C " + util::sq(root) + " checkout --quiet " + util::sq(target) + " 2>&1")
+        if r2 != 0 is
+            ui::fail("Nie udało się wypakować folderu z repozytorium.")
+            return 1
+        end
+    end
+    util::rm_rf(root + "/.git")
+    return 0
+end
