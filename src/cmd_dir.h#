@@ -1,0 +1,101 @@
+mod util
+mod ui
+mod opts
+mod link
+mod fetch
+mod place
+
+;; ── cmd_dir.h# ─ `getit dir <url>` ───────────────────────────────────────────
+;;
+;; GitHub: downloads the repository archive (tar.gz) and keeps only the wanted
+;; folder. Huge repositories, --sparse, GitLab, Codeberg and any other git server
+;; go through a shallow sparse-checkout, which fetches just that folder.
+
+pub fn run(o: opts::Opts) -> int is
+    if array_len(o.oo_pos) == 0 is
+        ui::fail("Podaj adres folderu, np. https://github.com/user/repo/tree/main/src")
+        ui::hint("getit dir --help")
+        return 2
+    end
+    let urls: [string] = o.oo_pos
+    let raw: string = urls[0]
+    let l0: link::Link = link::parse(raw)
+    if !l0.lk_ok is
+        ui::fail("Nie rozumiem adresu: " + raw)
+        ui::hint("Obsługiwane: github.com, gitlab.com, codeberg.org oraz skrót user/repo")
+        return 2
+    end
+    let l: link::Link = link::settle(l0)
+    if l.lk_proj == "" is
+        ui::fail("Ten adres nie wskazuje repozytorium git: " + raw)
+        return 2
+    end
+
+    ui::title("getit dir • Pobieranie folderu")
+    let r: link::Ref = link::resolve(l, o.oo_ref)
+    let gref: string = r.rf_ref
+    let gpath: string = r.rf_path
+    let label: string = if gpath != "" then util::basename(gpath) else l.lk_repo
+    let dest: string = place::target(o, label)
+
+    ui::kv("Repo", l.lk_proj + (if l.lk_host != "github.com" then " (" + l.lk_host + ")" else ""))
+    ui::kv("Ref", if gref != "" then gref else "(domyślna gałąź)")
+    ui::kv("Folder", if gpath != "" then gpath else "(całe repozytorium)")
+    ui::kv("Cel", dest)
+
+    let mut use_git: bool = o.oo_sparse || l.lk_kind != "github"
+    if !use_git && gpath != "" is
+        let kb: int = fetch::github_size_kb(l.lk_user, l.lk_repo)
+        if kb > 300000 is
+            use_git = true
+            ui::note("Duże repozytorium (" + util::human_bytes(kb * 1024) + ") – pobieram tylko ten folder (sparse-checkout).")
+        end
+    end
+
+    let mode: string = place::resolve_mode(dest, o, true)
+    if mode == "abort" is return 1 end
+    if o.oo_dry is
+        ui::kv("Metoda", if use_git then "git sparse-checkout" else "archiwum tar.gz")
+        ui::note("(--dry-run: nic nie zostało pobrane)")
+        return 0
+    end
+
+    let tmp: string = util::tmp_new()
+    let mut rc: int = 1
+    ui::blank()
+    if !use_git is
+        rc = fetch::tarball(l.lk_user, l.lk_repo, gref, tmp)
+        if rc != 0 && util::tool_exists("git") is
+            ui::note("Archiwum niedostępne – próbuję przez git.")
+            util::rm_rf(tmp + "/x")
+            use_git = true
+        end
+    end
+    if use_git is
+        rc = fetch::git_checkout(link::clone_url(l), gref, gpath, tmp)
+    end
+    if rc != 0 is
+        util::rm_rf(tmp)
+        return 1
+    end
+
+    let root: string = tmp + "/x"
+    let src: string = if gpath != "" then root + "/" + gpath else root
+    if !util::exists(src) is
+        ui::fail("W repozytorium nie ma '" + gpath + "'" + (if gref != "" then " (ref: " + gref + ")" else "") + ".")
+        let top: string = util::list_head(root, 12)
+        if top != "" is ui::hint("W katalogu głównym jest: " + top) end
+        util::rm_rf(tmp)
+        return 1
+    end
+
+    if place::apply(src, dest, mode) != 0 is
+        ui::fail("Nie udało się zapisać do '" + dest + "'.")
+        util::rm_rf(tmp)
+        return 1
+    end
+    util::rm_rf(tmp)
+    ui::ok("Gotowe! " + to_string(util::count_files(dest)) + " plików (" + util::human_bytes(util::tree_bytes(dest)) + ") → " + dest)
+    if ui::quiet() is write(dest) end
+    return 0
+end
