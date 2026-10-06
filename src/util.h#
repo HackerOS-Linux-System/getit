@@ -1,0 +1,184 @@
+extern static [c] is
+    fn system(cmd: string) -> int
+end
+
+pub fn run(cmd: string) -> int is
+    return system(cmd)
+end
+
+;; trimmed output of a command (stdout and stderr – add 2>/dev/null yourself)
+pub fn capture(cmd: string) -> string is
+    return string_trim(shell(cmd))
+end
+
+;; POSIX single-quote a value so it is safe inside a shell command line.
+pub fn sq(s: string) -> string is
+    return "'" + string_replace(s, "'", "'\\''") + "'"
+end
+
+pub fn tool_exists(name: string) -> bool is
+    return system("command -v " + sq(name) + " >/dev/null 2>&1") == 0
+end
+
+pub fn tty_out() -> bool is
+    return system("test -t 1") == 0
+end
+
+pub fn tty_err() -> bool is
+    return system("test -t 2") == 0
+end
+
+pub fn tty_in() -> bool is
+    return system("test -t 0 && test -t 1") == 0
+end
+
+;; ── strings ──────────────────────────────────────────────────────────────────
+
+fn tenths(n: int, unit: int) -> string is
+    return to_string(n / unit) + "." + to_string(((n % unit) * 10) / unit)
+end
+
+pub fn human_bytes(n: int) -> string is
+    if n < 1024 is return to_string(n) + " B" end
+    if n < 1048576 is return tenths(n, 1024) + " KB" end
+    if n < 1073741824 is return tenths(n, 1048576) + " MB" end
+    return tenths(n, 1073741824) + " GB"
+end
+
+pub fn join_from(items: [string], start: int, sep: string) -> string is
+    let mut out: string = ""
+    let mut i: int = start
+    while i < array_len(items) is
+        if i > start is out = out + sep end
+        out = out + items[i]
+        i += 1
+    end
+    return out
+end
+
+pub fn cut_at(s: string, marker: string) -> string is
+    let i: int = string_find(s, marker)
+    if i < 0 is return s end
+    return string_slice(s, 0, i)
+end
+
+pub fn trim_slashes(s: string) -> string is
+    let mut p: string = s
+    while string_len(p) > 1 && string_ends_with(p, "/") is
+        p = string_slice(p, 0, string_len(p) - 1)
+    end
+    return p
+end
+
+pub fn url_decode(s: string) -> string is
+    let a: string = string_replace(s, "%20", " ")
+    let b: string = string_replace(a, "%28", "(")
+    let c: string = string_replace(b, "%29", ")")
+    let d: string = string_replace(c, "%2B", "+")
+    let e: string = string_replace(d, "%2C", ",")
+    let f: string = string_replace(e, "%5B", "[")
+    let g: string = string_replace(f, "%5D", "]")
+    return string_replace(g, "%40", "@")
+end
+
+pub fn array_has(items: [string], needle: string) -> bool is
+    let mut i: int = 0
+    while i < array_len(items) is
+        if items[i] == needle is return true end
+        i += 1
+    end
+    return false
+end
+
+;; ── paths ────────────────────────────────────────────────────────────────────
+
+;; "/a/b/c" -> "c"      "/a/b/" -> "b"
+pub fn basename(path: string) -> string is
+    let p: string = trim_slashes(path)
+    let mut cut: int = -1
+    let mut i: int = 0
+    while i < string_len(p) is
+        if string_at(p, i) == "/" is cut = i end
+        i += 1
+    end
+    if cut < 0 is return p end
+    return string_slice(p, cut + 1, string_len(p))
+end
+
+;; "/a/b/c" -> "/a/b"    "/a" -> "/"    "a" -> "."
+pub fn dirname(path: string) -> string is
+    let p: string = trim_slashes(path)
+    let mut cut: int = -1
+    let mut i: int = 0
+    while i < string_len(p) is
+        if string_at(p, i) == "/" is cut = i end
+        i += 1
+    end
+    if cut < 0 is return "." end
+    if cut == 0 is return "/" end
+    return string_slice(p, 0, cut)
+end
+
+pub fn mkdir_p(dir: string) -> int is
+    return system("mkdir -p " + sq(dir))
+end
+
+pub fn rm_rf(dir: string) -> bool is
+    if dir == "" || dir == "/" || dir == "." || dir == ".." is return false end
+    return system("rm -rf " + sq(dir)) == 0
+end
+
+pub fn exists(path: string) -> bool is
+    return file_exists(path) || dir_exists(path)
+end
+
+;; a fresh scratch directory (honours $TMPDIR)
+pub fn tmp_new() -> string is
+    let t: string = env_get("TMPDIR")
+    let base: string = if t != "" then t else "/tmp"
+    let d: string = trim_slashes(base) + "/getit-" + to_string(proc_id()) + "-" + to_string(time_ms())
+    mkdir_p(d)
+    return d
+end
+
+;; true for "/", $HOME and the current directory – never delete/replace those
+pub fn is_protected(path: string) -> bool is
+    let p: string = capture("cd " + sq(path) + " 2>/dev/null && pwd -P")
+    if p == "" is return false end
+    if p == "/" is return true end
+    if p == capture("cd \"$HOME\" 2>/dev/null && pwd -P") is return true end
+    return p == capture("pwd -P")
+end
+
+pub fn file_bytes(path: string) -> int is
+    return str_to_int(capture("wc -c < " + sq(path) + " 2>/dev/null"))
+end
+
+;; size of a file or a whole directory tree, in bytes
+pub fn tree_bytes(path: string) -> int is
+    if dir_exists(path) is
+        return str_to_int(capture("du -sk " + sq(path) + " 2>/dev/null | cut -f1")) * 1024
+    end
+    return file_bytes(path)
+end
+
+pub fn count_files(path: string) -> int is
+    if !dir_exists(path) is
+        if file_exists(path) is return 1 end
+        return 0
+    end
+    return str_to_int(capture("find " + sq(path) + " -type f 2>/dev/null | wc -l"))
+end
+
+;; first `n` entries of a directory, comma separated (for "did you mean" hints)
+pub fn list_head(dir: string, n: int) -> string is
+    return capture("ls -1 " + sq(dir) + " 2>/dev/null | head -n " + to_string(n) + " | tr '\\n' ',' | sed 's/,$//; s/,/, /g'")
+end
+
+;; ── interaction ──────────────────────────────────────────────────────────────
+
+;; asks on the terminal, returns the lower-cased answer ("" = just Enter)
+pub fn ask(prompt: string) -> string is
+    write(prompt)
+    return string_lower(capture("read -r a </dev/tty 2>/dev/null; printf %s \"$a\""))
+end
