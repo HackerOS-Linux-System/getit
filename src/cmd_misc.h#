@@ -1,0 +1,74 @@
+mod util
+mod ui
+mod opts
+mod link
+mod fetch
+mod help
+
+;; ── cmd_misc.h# ─ `getit info` and `getit doctor` ────────────────────────────
+
+fn tool_line(name: string, needed: string) is
+    if util::tool_exists(name) is
+        ui::line("   " + ui::green("✓") + " " + string_pad_right(name, 10) + ui::dim(util::capture("command -v " + name)))
+    else is
+        ui::line("   " + ui::yellow("–") + " " + string_pad_right(name, 10) + ui::dim("brak (" + needed + ")"))
+    end
+end
+
+pub fn doctor() -> int is
+    ui::title("getit doctor")
+    ui::line(ui::bold(" Narzędzia"))
+    tool_line("curl", "pobieranie – wymagane (albo wget)")
+    tool_line("wget", "zapasowy downloader")
+    tool_line("tar", "wymagane dla getit dir")
+    tool_line("git", "sparse-checkout, repo, gałęzie z '/'")
+    tool_line("sha256sum", "opcja --sha256")
+    ui::blank()
+    ui::line(ui::bold(" Tokeny"))
+    ui::line("   GitHub    " + (if fetch::token_var("github") != "" then "ustawiony (" + fetch::token_var("github") + ")" else "brak – limit 60 zapytań/h, tylko publiczne repo"))
+    ui::line("   GitLab    " + (if fetch::token_var("gitlab") != "" then "ustawiony" else "brak"))
+    ui::line("   Codeberg  " + (if fetch::token_var("codeberg") != "" then "ustawiony" else "brak"))
+    ui::blank()
+    ui::line(ui::bold(" Sieć"))
+    let code: string = fetch::probe("https://github.com")
+    if fetch::good(code) is
+        ui::line("   " + ui::green("✓") + " github.com odpowiada (" + code + ")")
+        return 0
+    end
+    ui::line("   " + ui::red("✗") + " github.com: " + code)
+    fetch::explain(code, "https://github.com")
+    return 1
+end
+
+pub fn info(o: opts::Opts) -> int is
+    if array_len(o.oo_pos) == 0 is
+        ui::fail("Podaj link, np. getit info https://github.com/user/repo/tree/main/src")
+        return 2
+    end
+    let urls: [string] = o.oo_pos
+    let raw: string = urls[0]
+    let l0: link::Link = link::parse(raw)
+    if !l0.lk_ok is
+        ui::fail("Nie rozumiem adresu: " + raw)
+        return 2
+    end
+    let l: link::Link = link::settle(l0)
+    let what: string = link::classify(l)
+    ui::title("getit info")
+    ui::kv("Serwer", l.lk_host + " (" + l.lk_kind + ")")
+    if l.lk_proj != "" is ui::kv("Repo", l.lk_proj) end
+    ui::kv("Typ", l.lk_mode + " → getit " + what)
+    if what == "file" is
+        let url: string = link::file_url(l)
+        ui::kv("Raw URL", url)
+        ui::kv("Nazwa", link::file_name(l))
+        let code: string = fetch::probe(url)
+        ui::kv("HTTP", code + (if fetch::good(code) then "  " + fetch::describe(url) else ""))
+    else is
+        let r: link::Ref = link::resolve(l, o.oo_ref)
+        ui::kv("Ref", if r.rf_ref != "" then r.rf_ref else "(domyślna gałąź)")
+        ui::kv("Folder", if r.rf_path != "" then r.rf_path else "(całe repozytorium)")
+        ui::kv("Clone", link::clone_url(l))
+    end
+    return 0
+end
