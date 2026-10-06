@@ -1,0 +1,108 @@
+mod util
+mod ui
+mod opts
+mod link
+mod fetch
+mod place
+
+;; ── cmd_file.h# ─ `getit file <url>...` ──────────────────────────────────────
+
+fn one(raw: string, o: opts::Opts, single: bool) -> int is
+    let l0: link::Link = link::parse(raw)
+    if !l0.lk_ok is
+        ui::fail("Nie rozumiem adresu: " + raw)
+        ui::hint("Podaj pełny URL albo skrót user/repo/blob/main/plik")
+        return 2
+    end
+    let l: link::Link = link::settle(l0)
+    let url: string = link::file_url(l)
+    let default_name: string = link::file_name(l)
+
+    ;; -o NAME, -o DIR/ or -d DIR
+    let mut name: string = default_name
+    if single && o.oo_out != "" is
+        if string_ends_with(o.oo_out, "/") || dir_exists(o.oo_out) is
+            name = util::trim_slashes(o.oo_out) + "/" + default_name
+        else is
+            name = o.oo_out
+        end
+    end
+    let dest: string = if o.oo_dir != "" && !string_starts_with(name, "/") then util::trim_slashes(o.oo_dir) + "/" + name else name
+
+    ui::title("getit file • Pobieranie pliku")
+    if l.lk_mode == "blob" is
+        ui::note("To strona podglądu – pobieram surowy plik (raw), nie HTML.")
+    end
+    ui::kv("URL", url)
+    ui::kv("Zapis", dest)
+
+    let mode: string = place::resolve_mode(dest, o, false)
+    if mode == "abort" is return 1 end
+    if o.oo_dry is
+        ui::note("(--dry-run: nic nie zostało pobrane)")
+        return 0
+    end
+
+    util::mkdir_p(util::dirname(dest))
+    let part: string = dest + ".part"
+    ui::blank()
+    let code: string = fetch::get(url, part, true)
+    if !fetch::good(code) is
+        util::run("rm -f " + util::sq(part))
+        fetch::explain(code, url)
+        return 1
+    end
+
+    let lname: string = string_lower(dest)
+    let wants_html: bool = string_ends_with(lname, ".html") || string_ends_with(lname, ".htm")
+    if !wants_html && fetch::looks_html(part) is
+        if l.lk_kind != "other" is
+            util::run("rm -f " + util::sq(part))
+            ui::fail("Serwer zwrócił stronę HTML zamiast pliku.")
+            ui::hint("Sprawdź czy plik istnieje i czy link prowadzi do pliku (nie do strony).")
+            return 1
+        end
+        ui::warn("Pobrana treść wygląda jak strona HTML, a nie " + util::basename(dest) + ".")
+    end
+
+    if o.oo_sha != "" is
+        if !fetch::verify_sha(part, o.oo_sha) is
+            util::run("rm -f " + util::sq(part))
+            ui::fail("Suma SHA-256 się nie zgadza – plik odrzucony.")
+            return 1
+        end
+        ui::ok("Suma SHA-256 zgodna")
+    end
+
+    if place::apply(part, dest, if mode == "new" then "new" else "replace") != 0 is
+        util::run("rm -f " + util::sq(part))
+        ui::fail("Nie udało się zapisać pliku '" + dest + "'.")
+        return 1
+    end
+    ui::ok("Gotowe! " + util::basename(dest) + " (" + util::human_bytes(util::file_bytes(dest)) + ")")
+    if ui::quiet() is write(dest) end
+    return 0
+end
+
+pub fn run(o: opts::Opts) -> int is
+    let n: int = array_len(o.oo_pos)
+    if n == 0 is
+        ui::fail("Podaj adres pliku, np. https://github.com/user/repo/blob/main/plik.txt")
+        ui::hint("getit file --help")
+        return 2
+    end
+    if n > 1 && o.oo_out != "" is
+        ui::fail("-o działa tylko przy jednym adresie (użyj -d KATALOG dla wielu plików).")
+        return 2
+    end
+    let mut rc: int = 0
+    let mut i: int = 0
+    while i < n is
+        if i > 0 is ui::blank() end
+        let urls: [string] = o.oo_pos
+        let r: int = one(urls[i], o, n == 1)
+        if r != 0 is rc = r end
+        i += 1
+    end
+    return rc
+end
