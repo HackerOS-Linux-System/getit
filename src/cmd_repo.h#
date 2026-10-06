@@ -1,0 +1,87 @@
+mod util
+mod ui
+mod opts
+mod link
+mod fetch
+
+;; ── cmd_repo.h# ─ `getit repo <url> [--clone | --push]` ──────────────────────
+
+pub fn run(o: opts::Opts) -> int is
+    if array_len(o.oo_pos) == 0 is
+        ui::fail("Podaj adres repozytorium, np. https://github.com/user/repo")
+        ui::hint("getit repo --help")
+        return 2
+    end
+    if !util::tool_exists("git") is
+        ui::fail("Brak programu git.")
+        ui::hint("Zainstaluj git:  apt install git")
+        return 1
+    end
+    let urls: [string] = o.oo_pos
+    let raw: string = urls[0]
+    let l: link::Link = link::parse(raw)
+    let ssh: bool = string_starts_with(raw, "git@") || string_starts_with(raw, "ssh://")
+    if !l.lk_ok || l.lk_proj == "" is
+        ui::fail("Nie rozumiem adresu repozytorium: " + raw)
+        return 2
+    end
+    let url: string = if ssh then raw else link::clone_url(l)
+    let action: string = if o.oo_action == "" then "clone" else o.oo_action
+
+    if action == "push" is
+        ui::title("getit repo • Wysyłanie (push)")
+        if util::run("git rev-parse --git-dir >/dev/null 2>&1") != 0 is
+            ui::fail("Bieżący katalog nie jest repozytorium git.")
+            ui::hint("Wejdź do katalogu projektu albo użyj: getit repo URL --clone")
+            return 1
+        end
+        let refspec: string = if o.oo_ref != "" then "HEAD:refs/heads/" + o.oo_ref else "HEAD"
+        ui::kv("Cel", url)
+        ui::kv("Co", refspec)
+        if o.oo_dry is
+            ui::note("(--dry-run: nic nie zostało wysłane)")
+            return 0
+        end
+        let rc: int = util::run("git push " + util::sq(url) + " " + util::sq(refspec))
+        if rc != 0 is
+            ui::fail("git push nie powiódł się.")
+            ui::hint("Sprawdź uprawnienia (SSH/token) oraz czy gałąź nie wymaga najpierw git pull.")
+            return 1
+        end
+        ui::ok("Wysłano.")
+        return 0
+    end
+
+    ui::title("getit repo • Klonowanie")
+    let mut gref: string = o.oo_ref
+    if gref == "" && (l.lk_mode == "tree" || l.lk_mode == "blob") is
+        let rr: link::Ref = link::resolve(l, "")
+        gref = rr.rf_ref
+    end
+    let name: string = if o.oo_out != "" then o.oo_out else l.lk_repo
+    let dest: string = if o.oo_dir != "" && !string_starts_with(name, "/") then util::trim_slashes(o.oo_dir) + "/" + name else name
+    ui::kv("Repo", url)
+    ui::kv("Ref", if gref != "" then gref else "(domyślna gałąź)")
+    ui::kv("Cel", dest)
+    if util::exists(dest) && util::count_files(dest) > 0 is
+        ui::fail("'" + dest + "' już istnieje i nie jest puste.")
+        ui::hint("Wybierz inną nazwę: -o NAZWA")
+        return 1
+    end
+    if o.oo_dry is
+        ui::note("(--dry-run: nic nie zostało sklonowane)")
+        return 0
+    end
+    let depth: string = if o.oo_depth > 0 then " --depth " + to_string(o.oo_depth) else ""
+    let br: string = if gref != "" then " --branch " + util::sq(gref) else ""
+    let prog: string = if ui::quiet() then " --quiet" else ""
+    ui::blank()
+    let rc: int = util::run("GIT_TERMINAL_PROMPT=0 git" + fetch::git_auth(url) + " clone" + prog + depth + br + " " + util::sq(url) + " " + util::sq(dest))
+    if rc != 0 is
+        ui::fail("git clone nie powiódł się.")
+        ui::hint("Sprawdź adres, nazwę gałęzi oraz uprawnienia (GITHUB_TOKEN dla prywatnych).")
+        return 1
+    end
+    ui::ok("Sklonowano do " + dest)
+    return 0
+end
