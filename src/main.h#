@@ -1,601 +1,126 @@
-use "std -> fs"      from "fs"
-use "std -> strings" from "strs"
-use "std -> json"    from "jsn"
+mod util
+mod ui
+mod opts
+mod link
+mod help
+mod cmd_file
+mod cmd_dir
+mod cmd_repo
+mod cmd_misc
 
-;; ── ANSI style constants ──────────────────────────────────────────────────────
+;; ── main.h# ─ argument parsing and dispatch only ─────────────────────────────
+;;
+;; getit <link>        – guesses file / folder / repository from the link
+;; getit file|dir|repo – explicit, but a wrong choice is corrected automatically
+;;                       (`file` on a folder link behaves like `dir` and vice versa)
 
-pub let TITLE   : string = "\x1b[1;38;5;86m"
-pub let SUCCESS : string = "\x1b[1;38;5;82m"
-pub let ERROR   : string = "\x1b[1;31m"
-pub let WARNING : string = "\x1b[1;38;5;208m"
-pub let INFO    : string = "\x1b[1;38;5;39m"
-pub let RESET   : string = "\x1b[0m"
-
-fn styled(s: string, style: string) -> string is
-    return style + s + RESET
+extern static [c] is
+    fn exit(code: int)
 end
 
-;; ── Entry point ───────────────────────────────────────────────────────────────
+fn is_command(c: string) -> bool is
+    return c == "file" || c == "dir" || c == "repo" || c == "get" || c == "info" || c == "doctor"
+end
+
+fn looks_like_link(s: string) -> bool is
+    return string_contains(s, "/") || string_contains(s, "@")
+end
+
+fn suggest(c: string) -> string is
+    let names: [string] = ["file", "dir", "repo", "info", "doctor"]
+    let mut i: int = 0
+    while i < array_len(names) is
+        let n: string = names[i]
+        if string_len(c) >= 2 && (string_starts_with(n, string_slice(c, 0, 2)) || string_starts_with(c, n)) is return n end
+        i += 1
+    end
+    return ""
+end
+
+;; run `kind` (file | dir | repo) for the first link
+fn dispatch(kind: string, o: opts::Opts) -> int is
+    if kind == "file" is return cmd_file::run(o) end
+    if kind == "dir" is return cmd_dir::run(o) end
+    return cmd_repo::run(o)
+end
+
+fn guess(requested: string, o: opts::Opts) -> int is
+    if array_len(o.oo_pos) == 0 is
+        if requested == "" is
+            help::usage()
+            return 2
+        end
+        return dispatch(requested, o)
+    end
+    let urls: [string] = o.oo_pos
+    let l: link::Link = link::settle(link::parse(urls[0]))
+    if !l.lk_ok is
+        ui::fail("Nie rozumiem adresu: " + urls[0])
+        ui::hint("Przykład: getit https://github.com/user/repo/blob/main/plik  lub  getit user/repo")
+        return 2
+    end
+    let actual: string = link::classify(l)
+    if requested == "" is return dispatch(actual, o) end
+    ;; `repo` is always honoured; file <-> dir are swapped when the link says so
+    if requested == "repo" is return cmd_repo::run(o) end
+    if requested == "file" && actual == "repo" is return dispatch("dir", o) end
+    if requested != actual && actual != "repo" && array_len(o.oo_pos) == 1 is
+        ui::note("Ten link wskazuje " + (if actual == "dir" then "folder" else "plik") + " – używam 'getit " + actual + "'.")
+        return dispatch(actual, o)
+    end
+    return dispatch(requested, o)
+end
 
 fn main() is
-    let args: [string] = env::args()
-
-    if array_len(args) < 2 is
-        print_usage()
-        return
+    let args: [string] = env_args()
+    let argc: int = array_len(args)
+    if argc < 2 is
+        help::usage()
+        exit(0)
+    end
+    let cmd: string = args[1]
+    ui::init(false)
+    if cmd == "-h" || cmd == "--help" || cmd == "help" is
+        help::show(if argc > 2 then args[2] else "")
+        exit(0)
+    end
+    if cmd == "-V" || cmd == "--version" || cmd == "version" is
+        help::version()
+        exit(0)
     end
 
-    let subcmd: string = args[1]
-
-    if subcmd == "file" is
-        handle_file(args)
-    elsif subcmd == "repo" is
-        handle_repo(args)
-    elsif subcmd == "dir" is
-        handle_dir(args)
-    elsif subcmd == "-h" || subcmd == "--help" is
-        print_usage()
-    else
-        write(styled("Błąd: Nieznana komenda '" + subcmd + "'", ERROR))
-        print_usage()
+    let named: bool = is_command(cmd)
+    let o: opts::Opts = opts::parse(args, if named then 2 else 1)
+    ui::init(o.oo_quiet)
+    if o.oo_bad != "" is
+        ui::fail(o.oo_bad)
+        ui::hint("Lista opcji: getit --help")
+        exit(2)
     end
-end
-
-fn print_usage() is
-    write(styled("getit • Uniwersalne narzędzie do pobierania i zarządzania", TITLE))
-    write("")
-    write("Użycie:")
-    write("  " + styled("getit file <link> [flagi]", INFO) + "         - Pobierz pojedynczy plik (jak curl/wget)")
-    write("  " + styled("getit repo <link.git> [flagi]", INFO) + "     - Operacje git (np. -clone, -push)")
-    write("  " + styled("getit dir <katalog_github> [flagi]", INFO) + " - Pobierz folder z GitHub")
-    write("")
-    write("Flagi ogólne: -h (pomoc)")
-end
-
-;; ── Utilities ─────────────────────────────────────────────────────────────────
-
-;; Every external command below is assembled as an `sh -c` string with the
-;; argument wrapped in single quotes, so a single quote inside the argument
-;; would break out of the quoting. Refuse such input up front.
-fn require_safe(value: string, what: string) is
-    if value.contains("'") is
-        write(styled("Błąd: " + what + " zawiera niedozwolony znak (')", ERROR))
-        proc::exit(1)
-    end
-end
-
-fn curl_exists() -> bool is
-    let result = proc::run_cmd("which curl", 3)
-    return result.exit_code == 0
-end
-
-fn check_curl() is
-    if !curl_exists() is
-        write(styled("Błąd: curl nie jest zainstalowany. Zainstaluj curl i spróbuj ponownie.", ERROR))
-        proc::exit(1)
-    end
-end
-
-fn basename(path: string) -> string is
-    ;; Extract filename from URL or path
-    let no_query: string = if path.contains("?") is
-        strs::split(path, "?")[0]
-    else
-        path
-    end
-    let parts: [string] = strs::split(no_query, "/")
-    if array_len(parts) == 0 is return path end
-    let last: string = parts[array_len(parts) - 1]
-    if last == "" && array_len(parts) > 1 is return parts[array_len(parts) - 2] end
-    return last
-end
-
-fn human_bytes(n: int) -> string is
-    if n < 1024 is return conv::int_to_str(n) + " B" end
-    if n < 1048576 is return conv::int_to_str(n / 1024) + " KB" end
-    if n < 1073741824 is return conv::int_to_str(n / 1048576) + " MB" end
-    return conv::int_to_str(n / 1073741824) + " GB"
-end
-
-;; ── handle_file ───────────────────────────────────────────────────────────────
-
-fn handle_file(args: [string]) is
-    if array_len(args) < 3 is
-        write(styled("Błąd: Podaj link do pliku", ERROR))
-        write("Użycie: getit file <URL> [-o FILENAME]")
-        proc::exit(1)
+    if o.oo_help is
+        help::show(if named then cmd else "")
+        exit(0)
     end
 
-    if args[2] == "-h" || args[2] == "--help" is
-        write("Użycie: getit file <URL> [-o NAZWA_PLIKU]")
-        return
-    end
-
-    check_curl()
-
-    let url: string = args[2]
-    require_safe(url, "URL")
-    let mut filename: string = basename(url)
-    if filename == "" is filename = "output" end
-
-    ;; Check for -o flag
-    let mut i: int = 3
-    while i < array_len(args) is
-        if args[i] == "-o" && i + 1 < array_len(args) is
-            filename = args[i + 1]
-            require_safe(filename, "nazwa pliku")
-            i += 2
-            continue
+    let mut rc: int = 0
+    if named is
+        if cmd == "doctor" is
+            rc = cmd_misc::doctor()
+        else if cmd == "info" is
+            rc = cmd_misc::info(o)
+        else if cmd == "get" is
+            rc = guess("", o)
+        else is
+            rc = guess(cmd, o)
         end
-        if args[i] == "-h" is
-            write("Użycie: getit file <URL> [-o NAZWA_PLIKU]")
-            return
-        end
-        i += 1
+    else if looks_like_link(cmd) is
+        rc = guess("", o)
+    else is
+        ui::fail("Nieznana komenda '" + cmd + "'.")
+        let s: string = suggest(cmd)
+        if s != "" is ui::hint("Czy chodziło o 'getit " + s + "'?") end
+        ui::hint("Pomoc: getit --help")
+        rc = 2
     end
-
-    write(styled("getit file • Pobieranie pliku", TITLE))
-    write(" URL: " + url)
-    write(" Zapisywanie jako: " + filename)
-    write("")
-
-    ;; Get file size first (HEAD request)
-    let head_cmd: string = "curl -sI -L --max-time 10 '" + url + "' 2>/dev/null"
-    let headers: string = proc::run_cmd(head_cmd, 15).stdout
-    let content_length: int = extract_content_length(headers)
-
-    if content_length > 0 is
-        write(styled("Rozmiar: " + human_bytes(content_length), INFO))
-    end
-
-    ;; Download with progress bar
-    write(styled("Pobieranie...", INFO))
-    let cmd: string = "curl -L --progress-bar --max-time 3600 -o '" + filename + "' '" + url + "' 2>&1"
-    let result = proc::run_cmd_live(cmd, 3600)
-
-    if result.exit_code != 0 is
-        write(styled("Błąd podczas pobierania:", ERROR))
-        write(result.stderr)
-        proc::exit(1)
-    end
-
-    if !fs::exists(filename) is
-        write(styled("Błąd: Plik nie został zapisany.", ERROR))
-        proc::exit(1)
-    end
-
-    let size: int = fs::size(filename)
-    write("")
-    write(styled("Gotowe! Pobrano plik: " + filename + " (" + human_bytes(size) + ")", SUCCESS))
-end
-
-fn extract_content_length(headers: string) -> int is
-    ;; curl -L prints the headers of every redirect hop; the real file size
-    ;; is the last non-zero Content-Length.
-    let lines: [string] = strs::split(headers, "\n")
-    let mut found: int = 0
-    let mut i: int = 0
-    while i < array_len(lines) is
-        let line: string = lines[i].trim().to_lower()
-        if line.starts_with("content-length:") is
-            let parts: [string] = strs::split(lines[i], ":")
-            if array_len(parts) >= 2 is
-                let n: int = conv::str_to_int(strs::trim(parts[1]))
-                if n > 0 is found = n end
-            end
-        end
-        i += 1
-    end
-    return found
-end
-
-;; ── handle_repo ───────────────────────────────────────────────────────────────
-
-fn handle_repo(args: [string]) is
-    if array_len(args) < 3 is
-        write(styled("Błąd: Podaj link do repozytorium", ERROR))
-        write("Użycie: getit repo <URL.git> -clone|-push")
-        proc::exit(1)
-    end
-
-    if args[2] == "-h" || args[2] == "--help" is
-        write("Flagi: -clone (klonuj), -push (push do remote)")
-        return
-    end
-
-    let link: string = args[2]
-    require_safe(link, "link do repozytorium")
-    let mut do_clone: bool = false
-    let mut do_push:  bool = false
-
-    let mut i: int = 3
-    while i < array_len(args) is
-        if args[i] == "-clone" is do_clone = true end
-        if args[i] == "-push"  is do_push  = true end
-        if args[i] == "-h" is
-            write("Flagi: -clone (klonuj), -push (push do remote)")
-            return
-        end
-        i += 1
-    end
-
-    write(styled("getit repo • Operacje Git", TITLE))
-    write(" Repo: " + link)
-    write("")
-
-    if do_clone is
-        write(styled("Klonowanie repozytorium...", INFO))
-        let result = proc::run_cmd_live("git clone '" + link + "' 2>&1", 600)
-        if result.exit_code != 0 is
-            write(styled("Błąd podczas klonowania: " + result.stderr, ERROR))
-            proc::exit(1)
-        end
-        write(styled("Repozytorium sklonowane pomyślnie", SUCCESS))
-    elsif do_push is
-        write(styled("Pushowanie zmian...", INFO))
-        proc::run_cmd("git remote add origin '" + link + "' 2>/dev/null", 10)
-        let result = proc::run_cmd_live("git push origin main 2>&1", 120)
-        if result.exit_code != 0 is
-            write(styled("Błąd podczas push: " + result.stderr, ERROR))
-            proc::exit(1)
-        end
-        write(styled("Zmiany wypchnięte pomyślnie", SUCCESS))
-    else
-        write(styled("Błąd: Podaj flagę, np. -clone lub -push", ERROR))
-        proc::exit(1)
-    end
-end
-
-;; ── handle_dir ────────────────────────────────────────────────────────────────
-
-fn handle_dir(args: [string]) is
-    if array_len(args) < 3 is
-        write(styled("Błąd: Podaj URL folderu GitHub", ERROR))
-        write("Użycie: getit dir <github.com/user/repo/tree/branch/folder>")
-        proc::exit(1)
-    end
-
-    if args[2] == "-h" || args[2] == "--help" is
-        write("Użycie: getit dir <URL_GITHUB>")
-        write("Przykłady:")
-        write("  getit dir https://github.com/user/repo/tree/main/src")
-        write("  getit dir github.com/user/repo")
-        return
-    end
-
-    check_curl()
-
-    let raw_url: string = args[2]
-    require_safe(raw_url, "URL")
-
-    let mut i: int = 3
-    while i < array_len(args) is
-        if args[i] == "-h" is
-            write("Użycie: getit dir <URL_GITHUB>")
-            write("Przykłady:")
-            write("  getit dir https://github.com/user/repo/tree/main/src")
-            write("  getit dir github.com/user/repo")
-            return
-        end
-        i += 1
-    end
-
-    let github = parse_github_url(raw_url)
-
-    write(styled("getit dir • Pobieranie folderu z GitHub", TITLE))
-    write(" " + github.user + "/" + github.repo + " • " + github.branch)
-    if github.folder != "" is
-        write(" Folder: " + github.folder)
-    end
-    write("")
-
-    ;; Check if we should use sparse checkout (folder from large repo)
-    let tar_url: string = "https://github.com/" + github.user + "/" + github.repo +
-                  "/archive/refs/heads/" + github.branch + ".tar.gz"
-
-    ;; Load etag cache for "is this already up to date?" check
-    let cache: string = load_cache()
-    let cache_key: string = github.user + "/" + github.repo + "/" + github.branch + "/" + github.folder
-    let cached_etag: string = jsn::get_str(cache, cache_key)
-
-    write(styled("Sprawdzanie repozytorium...", INFO))
-
-    ;; HEAD request to get ETag and Content-Length
-    let mut head_flags: string = "curl -sI -L --max-time 15"
-    if cached_etag != "" is
-        head_flags = head_flags + " -H 'If-None-Match: " + cached_etag + "'"
-    end
-    let head_result = proc::run_cmd(head_flags + " '" + tar_url + "' 2>/dev/null", 20)
-    let head_headers: string = head_result.stdout
-
-    let http_status: int = extract_http_status(head_headers)
-    let content_length: int = extract_content_length(head_headers)
-    let new_etag: string = extract_etag(head_headers)
-
-    if http_status == 304 is
-        write(styled("Folder jest aktualny. Brak zmian.", SUCCESS))
-        return
-    end
-
-    if http_status != 200 is
-        write(styled("Błąd: Nie można uzyskać dostępu (status " + conv::int_to_str(http_status) + ")", ERROR))
-        proc::exit(1)
-    end
-
-    ;; Large archive warning (>2 GB)
-    let two_gb: int = 2147483648
-    if content_length > two_gb is
-        let size_mb: int = content_length / 1048576
-        write(styled("Ostrzeżenie: Archiwum jest duże (" + conv::int_to_str(size_mb) + " MB).", WARNING))
-        write("Kontynuować? (y/n): ")
-        let answer: string = strs::trim(env::read_line())
-        if answer.to_lower() != "y" is
-            write("Przerwano.")
-            return
-        end
-    end
-
-    ;; Decide strategy: sparse-checkout for large repos with a specific folder
-    let five_hundred_mb: int = 524288000
-    let use_sparse: bool = github.folder != "" && content_length > five_hundred_mb
-
-    let mut count: int = 0
-    let target_dir: string = if github.folder == "" is github.repo else last_path_segment(github.folder) end
-
-    if use_sparse is
-        write(styled("Archiwum jest duże, używam git sparse-checkout...", INFO))
-        count = download_with_sparse(github.user, github.repo, github.branch, github.folder)
-    else
-        write(styled("Pobieranie archiwum (" + human_bytes(content_length) + ")...", INFO))
-
-        let tmp_tar: string = "/tmp/getit_" + github.repo + "_" + github.branch + ".tar.gz"
-        let tmp_dir: string = "/tmp/getit_extract_" + conv::int_to_str(math::random_int(100000, 999999))
-
-        let dl_cmd: string = "curl -L --progress-bar --max-time 3600 -o '" + tmp_tar + "' '" + tar_url + "' 2>&1"
-        let dl_result = proc::run_cmd_live(dl_cmd, 3600)
-
-        if dl_result.exit_code != 0 is
-            write(styled("Błąd pobierania: " + dl_result.stderr, ERROR))
-            proc::exit(1)
-        end
-
-        write(styled("Rozpakowywanie plików...", INFO))
-
-        ;; Extract with tar, stripping the top-level directory
-        fs::mkdir(tmp_dir)
-        let strip: int = calc_strip(github.repo, github.branch, github.folder)
-        let mut tar_cmd: string = "tar -xzf '" + tmp_tar + "' --strip-components=" +
-                          conv::int_to_str(strip) + " -C '" + tmp_dir + "'"
-        if github.folder != "" is
-            ;; extract only the requested folder, not the whole repository
-            tar_cmd = tar_cmd + " --wildcards '*/" + github.folder + "/*'"
-        end
-        tar_cmd = tar_cmd + " 2>&1"
-        let tar_result = proc::run_cmd(tar_cmd, 300)
-
-        if tar_result.exit_code != 0 is
-            write(styled("Błąd rozpakowywania: " + tar_result.stderr, ERROR))
-            fs::remove(tmp_tar)
-            proc::exit(1)
-        end
-
-        ;; Atomic rename: tmp_dir → target_dir
-        if github.folder != "" is
-            ;; We extracted the specific subfolder — move it out
-            let extracted_sub: string = tmp_dir + "/" + last_path_segment(github.folder)
-            if fs::exists(extracted_sub) is
-                atomic_rename(extracted_sub, target_dir)
-                fs::remove_dir(tmp_dir)
-            else
-                atomic_rename(tmp_dir, target_dir)
-            end
-        else
-            atomic_rename(tmp_dir, target_dir)
-        end
-
-        count = count_entries(target_dir)
-        fs::remove(tmp_tar)
-    end
-
-    write(styled("\nGotowe! Pobrano " + conv::int_to_str(count) + " plików/folderów", SUCCESS))
-    write(" → " + styled("./" + target_dir, SUCCESS))
-
-    ;; Save etag for next run
-    if new_etag != "" is
-        let updated_cache: string = jsn::set_str(cache, cache_key, new_etag)
-        save_cache(updated_cache)
-    end
-end
-
-;; ── GitHub URL parser ─────────────────────────────────────────────────────────
-
-struct GithubRef is
-    pub user:   string
-    pub repo:   string
-    pub branch: string
-    pub folder: string
-end
-
-fn parse_github_url(raw: string) -> GithubRef is
-    let mut url: string = raw
-    if url.starts_with("https://github.com/") is
-        url = url[19..string_len(url)]
-    elsif url.starts_with("http://github.com/") is
-        url = url[18..string_len(url)]
-    elsif url.starts_with("github.com/") is
-        url = url[11..string_len(url)]
-    end
-    ;; Remove trailing slash
-    if url.ends_with("/") is url = url[0..string_len(url)-1] end
-
-    let parts: [string] = strs::split(url, "/")
-
-    if array_len(parts) < 2 is
-        write(styled("Błąd: Nieprawidłowy URL GitHub: " + raw, ERROR))
-        proc::exit(1)
-    end
-
-    let user: string = parts[0]
-    let repo: string = parts[1]
-    let mut branch: string = "main"
-    let mut folder: string = ""
-    let mut i: int = 2
-
-    ;; /tree/branchname/...
-    if i < array_len(parts) && parts[i] == "tree" && i + 1 < array_len(parts) is
-        branch = parts[i + 1]
-        i += 2
-    end
-
-    ;; remaining parts = folder path
-    if i < array_len(parts) is
-        let mut folder_parts: [string] = []
-        while i < array_len(parts) is
-            folder_parts.push(parts[i])
-            i += 1
-        end
-        folder = iter::join(folder_parts, "/")
-    end
-
-    return GithubRef { user: user, repo: repo, branch: branch, folder: folder }
-end
-
-;; ── Sparse checkout ───────────────────────────────────────────────────────────
-
-fn download_with_sparse(user: string, repo: string, branch: string, folder: string) -> int is
-    let tmp_dir: string = "/tmp/getit_sparse_" + conv::int_to_str(math::random_int(100000, 999999))
-    let git_url: string = "https://github.com/" + user + "/" + repo + ".git"
-
-    let cmds: [string] = [
-        "git clone -b " + branch + " --filter=blob:none --no-checkout '" + git_url + "' '" + tmp_dir + "' 2>&1",
-        "git -C '" + tmp_dir + "' sparse-checkout init --cone 2>&1",
-        "git -C '" + tmp_dir + "' sparse-checkout set '" + folder + "' 2>&1",
-        "git -C '" + tmp_dir + "' checkout " + branch + " 2>&1",
-    ]
-
-    let mut i: int = 0
-    while i < array_len(cmds) is
-        let result = proc::run_cmd_live(cmds[i], 300)
-        if result.exit_code != 0 is
-            write(styled("Błąd sparse-checkout: " + result.stderr, ERROR))
-            fs::remove_dir(tmp_dir)
-            proc::exit(1)
-        end
-        i += 1
-    end
-
-    ;; Remove .git directory (not needed)
-    fs::remove_dir(tmp_dir + "/.git")
-
-    let src_dir: string = tmp_dir + "/" + folder
-    let target  = last_path_segment(folder)
-
-    atomic_rename(src_dir, target)
-    fs::remove_dir(tmp_dir)
-
-    return count_entries(target)
-end
-
-;; ── Helper functions ──────────────────────────────────────────────────────────
-
-fn calc_strip(repo: string, branch: string, folder: string) -> int is
-    ;; tar strips repo-branch/ prefix (1 level) + folder depth
-    if folder == "" is return 1 end
-    let depth: int = array_len(strs::split(folder, "/")) - 1
-    return 1 + depth
-end
-
-fn last_path_segment(path: string) -> string is
-    if path == "" is return "." end
-    let mut p: string = path
-    if p.ends_with("/") is p = p[0..string_len(p)-1] end
-    let parts: [string] = strs::split(p, "/")
-    return parts[array_len(parts) - 1]
-end
-
-fn atomic_rename(src: string, dst: string) is
-    ;; If destination exists, move it to a .old backup first
-    if fs::exists(dst) is
-        let old: string = dst + ".old"
-        fs::rename(dst, old)
-        let result = proc::run_cmd("mv '" + src + "' '" + dst + "' 2>&1", 30)
-        if result.exit_code == 0 is
-            fs::remove_dir(old)
-        else
-            ;; Rollback
-            fs::rename(old, dst)
-            write(styled("Błąd: Nie można przenieść plików do " + dst, ERROR))
-            proc::exit(1)
-        end
-    else
-        let result = proc::run_cmd("mv '" + src + "' '" + dst + "' 2>&1", 30)
-        if result.exit_code != 0 is
-            write(styled("Błąd rename: " + result.stderr, ERROR))
-            proc::exit(1)
-        end
-    end
-end
-
-fn count_entries(dir: string) -> int is
-    if !fs::exists(dir) is return 0 end
-    let result = proc::run_cmd("find '" + dir + "' | wc -l 2>/dev/null", 30)
-    if result.exit_code != 0 is return 0 end
-    return conv::str_to_int(strs::trim(result.stdout))
-end
-
-fn extract_http_status(headers: string) -> int is
-    ;; Parse "HTTP/1.1 200 OK" or "HTTP/2 304". github.com/archive/... answers
-    ;; with a 302 redirect to codeload.github.com, so with `curl -L` several
-    ;; status lines appear — the status of the LAST one is the real answer.
-    let lines: [string] = strs::split(headers, "\n")
-    let mut status: int = 0
-    let mut i: int = 0
-    while i < array_len(lines) is
-        let line: string = strs::trim(lines[i])
-        if line.starts_with("HTTP/") is
-            let parts: [string] = strs::split(line, " ")
-            if array_len(parts) >= 2 is
-                status = conv::str_to_int(parts[1])
-            end
-        end
-        i += 1
-    end
-    return status
-end
-
-fn extract_etag(headers: string) -> string is
-    let lines: [string] = strs::split(headers, "\n")
-    let mut etag: string = ""
-    let mut i: int = 0
-    while i < array_len(lines) is
-        let line: string = lines[i].trim().to_lower()
-        if line.starts_with("etag:") is
-            ;; value may itself contain ':' (it never does for GitHub, but be safe)
-            let raw: string = strs::trim(lines[i])
-            etag = strs::trim(raw[5..string_len(raw)])
-        end
-        i += 1
-    end
-    return etag
-end
-
-;; ── ETag cache (~/.config/getit/cache.json) ───────────────────────────────────
-
-fn cache_path() -> string is
-    let home: string = env::get("HOME")
-    return home + "/.config/getit/cache.json"
-end
-
-fn load_cache() -> string is
-    let path: string = cache_path()
-    if !fs::exists(path) is return jsn::empty_object() end
-    let content: string = fs::read(path)
-    if content == "" is return jsn::empty_object() end
-    return jsn::parse(content)
-end
-
-fn save_cache(cache: string) is
-    let path: string = cache_path()
-    fs::mkdir(env::get("HOME") + "/.config/getit")
-    fs::write(path, jsn::stringify_pretty(cache, 2))
+    if rc != 0 is exit(rc) end
 end
